@@ -1,0 +1,57 @@
+{
+    "dataset": {
+        "train_data_path": "/mnt/data2/zhangjunan/open-universe/data/voicebank_demand/48k/train",
+        "sample_rate": 44100,
+        "test_noisy_path": "/mnt/data2/zhangjunan/open-universe/data/voicebank_demand/48k/test/noisy",
+        "batch_size": 64,
+    },
+    "model": {
+        "dac_path": "/mnt/data2/zhangjunan/muse-maskgit-pytorch/pretrained/weights.pth",
+        "MaskGitTransformer": {
+            "num_tokens": 1024,
+            "seq_len": 256,
+            "dim": 512,
+            "depth": 8,
+            "dim_head": 64,
+            "heads": 8,
+            "ff_mult": 4,
+            "vq_layers": 9
+        },
+        "AudioEncoder": {
+            "dim": 512,
+            "input_dim": 1025,
+            "n_fft": 2048,
+            "hop_length": 512,
+            "win_length": 2048,
+            "mlp_layers": [
+                1024,
+                512
+            ],
+            "transformer_layers": 6,
+        },
+        "MaskGit": {
+            "seq_len": 256,
+            "vq_layers": 9,
+            "cond_drop_prob": 0.25,
+        }
+    },
+    "train": {
+        "device": "cuda",
+        "epochs": 2000,
+        "optimizer": "adam",
+        "adam": {
+            "betas": [
+                0.9,
+                0.98
+            ],
+            "eps": 1e-09
+        },
+        "scheduler": "linear",
+        "linear": {
+            "num_warmup_steps": 4000,
+            "num_training_steps": 400000
+        },
+        "learning_rate": 4e-04,
+        "save_every": 5,
+    }
+}

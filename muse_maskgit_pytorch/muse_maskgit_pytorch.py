@@ -194,6 +194,35 @@ class TransformerBlocks(nn.Module):
 
         return self.norm(x)
 
+class SelfTransformerBlocks(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        depth,
+        dim_head = 64,
+        heads = 8,
+        ff_mult = 4,
+        flash = True
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                Attention(dim = dim, dim_head = dim_head, heads = heads, flash = flash),
+                FeedForward(dim = dim, mult = ff_mult)
+            ]))
+
+        self.norm = LayerNorm(dim)
+
+    def forward(self, x):
+        for attn, ff in self.layers:
+            x = attn(x) + x
+            x = ff(x) + x
+
+        return self.norm(x)
+
 # transformer - it's all we need
 
 class Transformer(nn.Module):
@@ -207,6 +236,7 @@ class Transformer(nn.Module):
         t5_name = DEFAULT_T5_NAME,
         self_cond = False,
         add_mask_id = False,
+        vq_layers = 1,
         **kwargs
     ):
         super().__init__()
@@ -214,23 +244,21 @@ class Transformer(nn.Module):
         self.mask_id = num_tokens if add_mask_id else None
 
         self.num_tokens = num_tokens
-        self.token_emb = nn.Embedding(num_tokens + int(add_mask_id), dim)
+        # self.token_emb = nn.Embedding(num_tokens + int(add_mask_id), dim)
         self.pos_emb = nn.Embedding(seq_len, dim)
         self.seq_len = seq_len
 
-        self.transformer_blocks = TransformerBlocks(dim = dim, **kwargs)
+        self.transformer_blocks = SelfTransformerBlocks(dim = dim, **kwargs)
         self.norm = LayerNorm(dim)
 
         self.dim_out = default(dim_out, num_tokens)
-        self.to_logits = nn.Linear(dim, self.dim_out, bias = False)
+        self.vq_layers = vq_layers
+        self.to_logits = nn.ModuleList([nn.Linear(dim, self.dim_out, bias=False) for _ in range(vq_layers)])
 
         # text conditioning
-
-        self.encode_text = partial(t5_encode_text, name = t5_name)
-
-        text_embed_dim = get_encoded_dim(t5_name)
-
-        self.text_embed_proj = nn.Linear(text_embed_dim, dim, bias = False) if text_embed_dim != dim else nn.Identity() 
+        # self.encode_text = partial(t5_encode_text, name = t5_name)
+        # text_embed_dim = get_encoded_dim(t5_name)
+        # self.text_embed_proj = nn.Linear(text_embed_dim, dim, bias = False) if text_embed_dim != dim else nn.Identity() 
 
         # optional self conditioning
 
@@ -260,6 +288,7 @@ class Transformer(nn.Module):
 
     def forward_with_neg_prompt(
         self,
+        *args,
         text_embed: torch.Tensor,
         neg_text_embed: torch.Tensor,
         cond_scale = 3.,
@@ -269,7 +298,7 @@ class Transformer(nn.Module):
         neg_logits = self.forward(*args, neg_text_embed = neg_text_embed, cond_drop_prob = 0., **kwargs)
         pos_logits, embed = self.forward(*args, return_embed = True, text_embed = text_embed, cond_drop_prob = 0., **kwargs)
 
-        logits = neg_logits + (pos_logits - neg_logits) * cond_scale
+        scaled_logits = neg_logits + (pos_logits - neg_logits) * cond_scale
 
         if return_embed:
             return scaled_logits, embed
@@ -289,25 +318,15 @@ class Transformer(nn.Module):
         texts: Optional[List[str]] = None,
         text_embeds: Optional[torch.Tensor] = None
     ):
-        device, b, n = x.device, *x.shape
+        # new x: embedded input, shape: [b, n, dim]
+        device, b, n = x.device, x.shape[0], x.shape[1]
         assert n <= self.seq_len
-
-        # prepare texts
-
-        assert exists(texts) ^ exists(text_embeds)
-
-        if exists(texts):
-            text_embeds = self.encode_text(texts)
-
-        context = self.text_embed_proj(text_embeds)
-
-        context_mask = (text_embeds != 0).any(dim = -1)
 
         # classifier free guidance
 
-        if cond_drop_prob > 0.:
-            mask = prob_mask_like((b, 1), 1. - cond_drop_prob, device)
-            context_mask = context_mask & mask
+        # if cond_drop_prob > 0.:
+        #     mask = prob_mask_like((b, 1), 1. - cond_drop_prob, device) # 用1 - cond_drop_prob是想要prob_mask_like函数输出False的概率为cond_drop_prob
+        #     context_mask = context_mask & mask
 
         # concat conditioning image token ids if needed
 
@@ -319,7 +338,8 @@ class Transformer(nn.Module):
 
         # embed tokens
 
-        x = self.token_emb(x)
+        # x = self.token_emb(x)
+        
         x = x + self.pos_emb(torch.arange(n, device = device))
 
         if self.self_cond:
@@ -327,9 +347,11 @@ class Transformer(nn.Module):
                 self_cond_embed = torch.zeros_like(x)
             x = x + self.self_cond_to_init_embed(self_cond_embed)
 
-        embed = self.transformer_blocks(x, context = context, context_mask = context_mask)
+        embed = self.transformer_blocks(x)
 
-        logits = self.to_logits(embed)
+        logits = torch.stack([linear(embed) for linear in self.to_logits], dim = 1) # [b, vq_layers, n, dim_out]
+        # print("logits.shape: ", logits.shape)
+        # print("labels.shape: ", labels.shape)
 
         if return_embed:
             return logits, embed
@@ -337,15 +359,48 @@ class Transformer(nn.Module):
         if not exists(labels):
             return logits
 
-        if self.dim_out == 1:
-            loss = F.binary_cross_entropy_with_logits(rearrange(logits, '... 1 -> ...'), labels)
-        else:
-            loss = F.cross_entropy(rearrange(logits, 'b n c -> b c n'), labels, ignore_index = ignore_index)
+        # labels: [b, vq_layers*n]
+        labels = labels.reshape(b, self.vq_layers, n)
+        loss = self._compute_cross_entropy(logits, labels, ignore_index)
 
         if not return_logits:
             return loss
 
         return loss, logits
+
+    def _compute_cross_entropy(
+        self, logits: torch.Tensor, targets: torch.Tensor, ignore_index
+    ):
+        """Compute cross entropy between multi-codebook targets and model's logits.
+        The cross entropy is computed per codebook to provide codebook-level cross entropy.
+        Valid timesteps for each of the codebook are pulled from the mask, where invalid
+        timesteps are set to 0.
+        
+        Adapted from https://github.com/facebookresearch/audiocraft/blob/main/audiocraft/solvers/musicgen.py#L212
+
+        Args:
+            logits (torch.Tensor): Model's logits of shape [B, K, T, card].
+            targets (torch.Tensor): Target codes, of shape [B, K, T].
+            mask (torch.Tensor): Mask for valid target codes, of shape [B, K, T].
+        Returns:
+            ce (torch.Tensor): Cross entropy averaged over the codebooks
+            ce_per_codebook (list of torch.Tensor): Cross entropy per codebook (detached).
+        """
+        B, K, T = targets.shape
+        assert logits.shape[:-1] == targets.shape
+        ce = torch.zeros([], device=targets.device)
+        ce_per_codebook = []
+        for k in range(K):
+            logits_k = logits[:, k, ...].contiguous().view(-1, logits.size(-1))  # [B x T, card]
+            targets_k = targets[:, k, ...].contiguous().view(-1)  # [B x T]
+            # print(f"{k}: logits_k.shape: {logits_k.shape}, targets_k.shape: {targets_k.shape}")
+            q_ce = F.cross_entropy(logits_k, targets_k, ignore_index=ignore_index)
+            ce += q_ce
+            ce_per_codebook.append(q_ce.detach())
+        # average cross entropy across codebooks
+        ce = ce / K
+        # return ce, ce_per_codebook
+        return ce
 
 # self critic wrapper
 
@@ -353,24 +408,24 @@ class SelfCritic(nn.Module):
     def __init__(self, net):
         super().__init__()
         self.net = net
-        self.to_pred = nn.Linear(net.dim, 1)
+        self.to_pred = nn.Linear(net.dim_out, 1)
 
     def forward_with_cond_scale(self, x, *args, **kwargs):
-        _, embeds = self.net.forward_with_cond_scale(x, *args, return_embed = True, **kwargs)
-        return self.to_pred(embeds)
+        logits, embeds = self.net.forward_with_cond_scale(x, *args, return_embed = True, **kwargs)
+        return self.to_pred(logits)
 
     def forward_with_neg_prompt(self, x, *args, **kwargs):
-        _, embeds = self.net.forward_with_neg_prompt(x, *args, return_embed = True, **kwargs)
-        return self.to_pred(embeds)
+        logits, embeds = self.net.forward_with_neg_prompt(x, *args, return_embed = True, **kwargs)
+        return self.to_pred(logits)
 
     def forward(self, x, *args, labels = None, **kwargs):
-        _, embeds = self.net(x, *args, return_embed = True, **kwargs)
-        logits = self.to_pred(embeds)
+        logits_net, embeds = self.net(x, *args, return_embed = True, **kwargs)
+        logits = self.to_pred(logits_net) # [b, vq_layers, n, 1]
 
         if not exists(labels):
             return logits
 
-        logits = rearrange(logits, '... 1 -> ...')
+        logits = rearrange(logits, '... 1 -> ...') # [b, vq_layers, n]
         return F.binary_cross_entropy_with_logits(logits, labels)
 
 # specialized transformers
@@ -422,20 +477,71 @@ def top_k(logits, thres = 0.9):
 def cosine_schedule(t):
     return torch.cos(t * math.pi * 0.5)
 
+class AudioEncoder(nn.Module):
+    def __init__(self, dim, input_dim, n_fft, hop_length, win_length, mlp_layers, mlp_activation=nn.ReLU(), transformer_layers=6):
+        super().__init__()
+        self.dim = dim
+        self.n_fft, self.hop_length, self.win_length = n_fft, hop_length, win_length
+        self.mlp_layers = mlp_layers
+
+        # Define MLP
+        self.input_dim = input_dim * 2
+        self.mlp = nn.Sequential(
+            nn.Linear(self.input_dim, mlp_layers[0]),
+            mlp_activation,
+            nn.Linear(mlp_layers[0], mlp_layers[1])
+        )
+
+        # Define Transformer Blocks
+        self.transformer_blocks = SelfTransformerBlocks(
+            dim=dim,
+            depth=transformer_layers,  # Example depth
+            dim_head=64,
+            heads=8,
+            ff_mult=4,
+            flash=True
+        )
+
+    def forward(self, x):
+        if len(x.shape) == 3:
+            x = x.squeeze(1)
+        # Compute STFT
+        X = torch.stft(x, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.win_length, return_complex=True)
+        # Power-law compression
+        X_mag = torch.abs(X)**0.3
+        X_phase = torch.angle(X)
+        X_compressed = torch.cat((X_mag, X_phase), dim=1)  # [b, 2*ceil((n - win_length) / hop_length + 1), 1 + n // hop_length]
+        X_compressed = X_compressed[:, :, :-1] # [b, 2*ceil((n - win_length) / hop_length + 1), n // hop_length]
+        # print("X_compressed.shape: ", X_compressed.shape)
+        X_compressed = X_compressed.transpose(1, 2)
+        # print("X_compressed.shape: ", X_compressed.shape)
+
+        # Apply MLP
+        mlp_output = self.mlp(X_compressed)
+
+        # Reshape to [batch_size, seq_len, feature_dim] for transformer
+        mlp_output = mlp_output.view(x.shape[0], -1, self.dim)  # Adjust according to actual sizes
+
+        # Pass through Transformer
+        embeddings = self.transformer_blocks(mlp_output)
+
+        return embeddings
+
 # main maskgit classes
 
 @beartype
 class MaskGit(nn.Module):
     def __init__(
         self,
-        image_size,
+        seq_len: int,
+        vq_layers: int,
+        vq_model: nn.Module,
+        audio_encoder: AudioEncoder,
         transformer: MaskGitTransformer,
         noise_schedule: Callable = cosine_schedule,
         token_critic: Optional[TokenCritic] = None,
         self_token_critic = False,
         vae: Optional[VQGanVAE] = None,
-        cond_vae: Optional[VQGanVAE] = None,
-        cond_image_size = None,
         cond_drop_prob = 0.5,
         self_cond_prob = 0.9,
         no_mask_token_prob = 0.,
@@ -444,22 +550,15 @@ class MaskGit(nn.Module):
         super().__init__()
         self.vae = vae.copy_for_eval() if exists(vae) else None
 
-        if exists(cond_vae):
-            self.cond_vae = cond_vae.eval()
-        else:
-            self.cond_vae = self.vae
-
-        assert not (exists(cond_vae) and not exists(cond_image_size)), 'cond_image_size must be specified if conditioning'
-
-        self.image_size = image_size
-        self.cond_image_size = cond_image_size
-        self.resize_image_for_cond_image = exists(cond_image_size)
+        self.seq_len = seq_len
+        self.vq_layers = vq_layers
+        
+        self.vq_model = vq_model
 
         self.cond_drop_prob = cond_drop_prob
 
         self.transformer = transformer
         self.self_cond = transformer.self_cond
-        assert self.vae.codebook_size == self.cond_vae.codebook_size == transformer.num_tokens, 'transformer num_tokens must be set to be equal to the vae codebook size'
 
         self.mask_id = transformer.mask_id
         self.noise_schedule = noise_schedule
@@ -478,6 +577,10 @@ class MaskGit(nn.Module):
         # percentage of tokens to be [mask]ed to remain the same token, so that transformer produces better embeddings across all tokens as done in original BERT paper
         # may be needed for self conditioning
         self.no_mask_token_prob = no_mask_token_prob
+        
+        self.code_emb = nn.ModuleList([nn.Embedding(self.transformer.num_tokens + 1, self.transformer.dim) for _ in range(vq_layers)])
+        self.audio_encoder = audio_encoder
+        # print(self.audio_encoder)
 
     def save(self, path):
         torch.save(self.state_dict(), path)
@@ -492,10 +595,9 @@ class MaskGit(nn.Module):
     @eval_decorator
     def generate(
         self,
-        texts: List[str],
+        noisy_audios: torch.Tensor,
         negative_texts: Optional[List[str]] = None,
         cond_images: Optional[torch.Tensor] = None,
-        fmap_size = None,
         temperature = 1.,
         topk_filter_thres = 0.9,
         can_remask_prev_masked = False,
@@ -504,17 +606,16 @@ class MaskGit(nn.Module):
         cond_scale = 3,
         critic_noise_scale = 1
     ):
-        fmap_size = default(fmap_size, self.vae.get_encoded_fmap_size(self.image_size))
-
         # begin with all image token ids masked
 
         device = next(self.parameters()).device
 
-        seq_len = fmap_size ** 2
+        batch = noisy_audios.shape[0]
 
-        batch_size = len(texts)
-
-        shape = (batch_size, seq_len)
+        # shape = (batch, self.vq_layers, self.seq_len)
+        
+        seq_len = self.vq_layers * self.seq_len
+        shape = (batch, seq_len)
 
         ids = torch.full(shape, self.mask_id, dtype = torch.long, device = device)
         scores = torch.zeros(shape, dtype = torch.float32, device = device)
@@ -523,7 +624,7 @@ class MaskGit(nn.Module):
 
         cond_ids = None
 
-        text_embeds = self.transformer.encode_text(texts)
+        # text_embeds = self.transformer.encode_text(texts)
 
         demask_fn = self.transformer.forward_with_cond_scale
 
@@ -534,26 +635,10 @@ class MaskGit(nn.Module):
         if use_token_critic:
             token_critic_fn = self.token_critic.forward_with_cond_scale
 
-        # negative prompting, as in paper
-
-        neg_text_embeds = None
-        if exists(negative_texts):
-            assert len(texts) == len(negative_texts)
-
-            neg_text_embeds = self.transformer.encode_text(negative_texts)
-            demask_fn = partial(self.transformer.forward_with_neg_prompt, neg_text_embeds = neg_text_embeds)
-
-            if use_token_critic:
-                token_critic_fn = partial(self.token_critic.forward_with_neg_prompt, neg_text_embeds = neg_text_embeds)
-
-        if self.resize_image_for_cond_image:
-            assert exists(cond_images), 'conditioning image must be passed in to generate for super res maskgit'
-            with torch.no_grad():
-                _, cond_ids, _ = self.cond_vae.encode(cond_images)
-
         self_cond_embed = None
 
-        for timestep, steps_until_x0 in tqdm(zip(torch.linspace(0, 1, timesteps, device = device), reversed(range(timesteps))), total = timesteps):
+        # for timestep, steps_until_x0 in tqdm(zip(torch.linspace(0, 1, timesteps, device = device), reversed(range(timesteps))), total = timesteps):
+        for timestep, steps_until_x0 in zip(torch.linspace(0, 1, timesteps, device = device), reversed(range(timesteps))):
 
             rand_mask_prob = self.noise_schedule(timestep)
             num_token_masked = max(int((rand_mask_prob * seq_len).item()), 1)
@@ -562,9 +647,20 @@ class MaskGit(nn.Module):
 
             ids = ids.scatter(1, masked_indices, self.mask_id)
 
+            x = ids
+            x = x.reshape(batch, self.vq_layers, self.seq_len)
+        
+            # encode x & noisy audio
+            code_embeds = torch.sum(torch.stack([
+                self.code_emb[i](x[:, i, :]) 
+                for i in range(self.vq_layers)
+            ], dim=1), dim=1) # [b, n, dim]
+            audio_embeds = self.audio_encoder(noisy_audios) # [b, n, dim]
+            
+            x = code_embeds + audio_embeds
+
             logits, embed = demask_fn(
-                ids,
-                text_embeds = text_embeds,
+                x,
                 self_cond_embed = self_cond_embed,
                 conditioning_token_ids = cond_ids,
                 cond_scale = cond_scale,
@@ -572,6 +668,8 @@ class MaskGit(nn.Module):
             )
 
             self_cond_embed = embed if self.self_cond else None
+            
+            logits = logits.reshape(batch, self.vq_layers * self.seq_len, -1)
 
             filtered_logits = top_k(logits, topk_filter_thres)
 
@@ -590,7 +688,6 @@ class MaskGit(nn.Module):
             if use_token_critic:
                 scores = token_critic_fn(
                     ids,
-                    text_embeds = text_embeds,
                     conditioning_token_ids = cond_ids,
                     cond_scale = cond_scale
                 )
@@ -612,59 +709,49 @@ class MaskGit(nn.Module):
 
         # get ids
 
-        ids = rearrange(ids, 'b (i j) -> b i j', i = fmap_size, j = fmap_size)
+        ids = rearrange(ids, 'b (i j) -> b i j', i = self.vq_layers, j = self.seq_len)
 
-        if not exists(self.vae):
-            return ids
+        with torch.no_grad():
+            audios = self.decode(ids)
+        return ids, audios
 
-        images = self.vae.decode_from_ids(ids)
-        return images
+    def encode(self, clean_audios: torch.Tensor):
+        with torch.no_grad():
+            x = self.vq_model.preprocess(clean_audios, 44100)
+            z, codes, latents, _, _ = self.vq_model.encode(x)
+        return codes
+
+    def decode(self, codes: torch.Tensor):
+        with torch.no_grad():
+            z_q, _, _ = self.vq_model.quantizer.from_codes(codes)
+            audios = self.vq_model.decode(z_q)
+        return audios
 
     def forward(
         self,
-        images_or_ids: torch.Tensor,
+        clean_audios: torch.Tensor,
+        noisy_audios: torch.Tensor,
         ignore_index = -1,
-        cond_images: Optional[torch.Tensor] = None,
-        cond_token_ids: Optional[torch.Tensor] = None,
         texts: Optional[List[str]] = None,
         text_embeds: Optional[torch.Tensor] = None,
         cond_drop_prob = None,
         train_only_generator = False,
         sample_temperature = None
     ):
-        # tokenize if needed
-
-        if images_or_ids.dtype == torch.float:
-            assert exists(self.vae), 'vqgan vae must be passed in if training from raw images'
-            assert all([height_or_width == self.image_size for height_or_width in images_or_ids.shape[-2:]]), 'the image you passed in is not of the correct dimensions'
-
-            with torch.no_grad():
-                _, ids, _ = self.vae.encode(images_or_ids)
-        else:
-            assert not self.resize_image_for_cond_image, 'you cannot pass in raw image token ids if you want the framework to autoresize image for conditioning super res transformer'
-            ids = images_or_ids
-
-        # take care of conditioning image if specified
-
-        if self.resize_image_for_cond_image:
-            cond_images_or_ids = F.interpolate(images_or_ids, self.cond_image_size, mode = 'nearest')
-
+        '''
+        audio_codes: [batch, audio_len]
+        noisy_audios: [batch, audio_len]
+        '''
+        
+        audio_codes = self.encode(clean_audios)
+        
         # get some basic variables
-
-        ids = rearrange(ids, 'b ... -> b (...)')
-
+        assert len(audio_codes.shape) == 3
+        assert audio_codes.shape[1] == self.vq_layers
+        assert audio_codes.shape[2] == self.seq_len
+        ids = rearrange(audio_codes, 'b ... -> b (...)') # [b, vq_layers, n] -> [b, vq_layers*n]
         batch, seq_len, device, cond_drop_prob = *ids.shape, ids.device, default(cond_drop_prob, self.cond_drop_prob)
-
-        # tokenize conditional images if needed
-
-        assert not (exists(cond_images) and exists(cond_token_ids)), 'if conditioning on low resolution, cannot pass in both images and token ids'
-
-        if exists(cond_images):
-            assert exists(self.cond_vae), 'cond vqgan vae must be passed in'
-            assert all([height_or_width == self.cond_image_size for height_or_width in cond_images.shape[-2:]])
-
-            with torch.no_grad():
-                _, cond_token_ids, _ = self.cond_vae.encode(cond_images)
+        # print("ids.shape: ", ids.shape)
 
         # prepare mask
 
@@ -684,6 +771,18 @@ class MaskGit(nn.Module):
             mask &= ~no_mask_mask
 
         x = torch.where(mask, mask_id, ids)
+        
+        x = x.reshape(batch, self.vq_layers, self.seq_len)
+        
+        # encode x & noisy audio
+        code_embeds = torch.sum(torch.stack([
+            self.code_emb[i](x[:, i, :]) 
+            for i in range(self.vq_layers)
+        ], dim=1), dim=1) # [b, n, dim]
+        audio_embeds = self.audio_encoder(noisy_audios) # [b, n, dim]
+        # print("code_embeds.shape: ", code_embeds.shape)
+        # print("audio_embeds.shape: ", audio_embeds.shape)
+        x = code_embeds + audio_embeds
 
         # get text embeddings
 
@@ -700,7 +799,7 @@ class MaskGit(nn.Module):
                 _, self_cond_embed = self.transformer(
                     x,
                     text_embeds = text_embeds,
-                    conditioning_token_ids = cond_token_ids,
+                    conditioning_token_ids = None,
                     cond_drop_prob = 0.,
                     return_embed = True
                 )
@@ -713,7 +812,7 @@ class MaskGit(nn.Module):
             x,
             text_embeds = text_embeds,
             self_cond_embed = self_cond_embed,
-            conditioning_token_ids = cond_token_ids,
+            conditioning_token_ids = None,
             labels = labels,
             cond_drop_prob = cond_drop_prob,
             ignore_index = ignore_index,
@@ -733,7 +832,7 @@ class MaskGit(nn.Module):
         bce_loss = self.token_critic(
             critic_input,
             text_embeds = text_embeds,
-            conditioning_token_ids = cond_token_ids,
+            conditioning_token_ids = None,
             labels = critic_labels,
             cond_drop_prob = cond_drop_prob
         )
