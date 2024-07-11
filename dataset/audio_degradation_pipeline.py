@@ -12,6 +12,7 @@ import scipy
 import soundfile as sf
 import random
 from tqdm.contrib.concurrent import process_map
+import torchaudio
 
 from dataset.rir_utils import estimate_early_rir
 
@@ -92,7 +93,7 @@ def detect_non_silence(
     # mean_power: (C, 1)
     mean_power = np.mean(power, axis=-1, keepdims=True)
     if np.all(mean_power == 0):
-        return np.full(x.shape, fill_value=True, dtype=np.bool)
+        return np.full(x.shape, fill_value=True, dtype=bool)
     # detect_frames: (C, T)
     detect_frames = power / mean_power > threshold
     # detects: (C, T, F)
@@ -173,7 +174,7 @@ def bandwidth_limitation(speech_sample, fs: int, fs_new: int, res_type="kaiser_b
     opts = {"res_type": res_type}
     if fs == fs_new:
         return speech_sample
-    assert fs > fs_new, (fs, fs_new)
+    # assert fs > fs_new, (fs, fs_new)
     ret = librosa.resample(speech_sample, orig_sr=fs, target_sr=fs_new, **opts)
     # resample back to the original sampling rate
     ret = librosa.resample(ret, orig_sr=fs_new, target_sr=fs, **opts)
@@ -214,6 +215,15 @@ def read_audio(filename, force_1ch=False, fs=None):
         audio = librosa.resample(audio, orig_sr=fs_, target_sr=fs, res_type="soxr_hq")
         return audio, fs
     return audio, fs_
+    # # redo using torchaudio
+    # audio, fs_ = torchaudio.load(filename, backend="ffmpeg")
+    # if force_1ch and audio.shape[0] > 1:
+    #     audio = audio.mean(dim=0, keepdim=True)
+    # audio = audio.numpy()
+    # if fs is not None and fs != fs_:
+    #     audio = librosa.resample(audio, orig_sr=fs_, target_sr=fs, res_type="soxr_hq")
+    #     return audio, fs
+    # return audio, fs_
 
 
 def save_audio(audio, filename, fs):
@@ -226,34 +236,55 @@ def save_audio(audio, filename, fs):
 # Main entry
 #############################
 
-# from voicefixer
-snr_min = 5
-snr_max = 40
+# # from voicefixer
+# snr_min = 5
+# snr_max = 40
 
 # p_reverb = 0.25
-p_reverb = 1
 
 # p_clipping = 0.25
-p_clipping = 0
-clipping_min_quantile = 0.06
-clipping_max_quantile = 0.9
+# clipping_min_quantile = 0.06
+# clipping_max_quantile = 0.9
 
 # p_bandwidth_limitation = 0.5
-p_bandwidth_limitation = 0
-bandwidth_limitation_rates = [8000, 16000, 22050, 24000, 32000, 44100, 48000]
-bandwidth_limitation_methods = (
-    "kaiser_best",
-    "kaiser_fast",
-    "scipy",
-    "polyphase",
-    #    "linear",
-    #    "zero_order_hold",
-    #    "sinc_best",
-    #    "sinc_fastest",
-    #    "sinc_medium",
-)
+# bandwidth_limitation_rates = [8000, 16000, 22050, 24000, 32000, 44100, 48000]
+# bandwidth_limitation_methods = (
+#     "kaiser_best",
+#     "kaiser_fast",
+#     "scipy",
+#     "polyphase",
+# )
 
-def process_from_audio_path(speech, noise, rir=None, fs=None, force_1ch=True, store_audio=False):
+default_degradation_config = {
+    "p_noise": 1.0,
+    "snr_min": -5,
+    "snr_max": 40,
+    
+    "p_reverb": 0.25,
+    
+    "p_clipping": 0.25,
+    "clipping_min_quantile": 0.06,
+    "clipping_max_quantile": 0.9,
+    
+    "p_bandwidth_limitation": 0.5,
+    "bandwidth_limitation_rates": [
+        8000,
+        16000,
+        22050,
+        24000,
+        32000,
+        44100,
+        48000,
+    ],
+    "bandwidth_limitation_methods": [
+        "kaiser_best",
+        "kaiser_fast",
+        "scipy",
+        "polyphase",
+    ],
+}
+
+def process_from_audio_path(speech, noise, rir=None, fs=None, force_1ch=True, degradation_config=default_degradation_config): 
     if fs is None:
         fs = sf.info(speech).samplerate
     
@@ -261,11 +292,14 @@ def process_from_audio_path(speech, noise, rir=None, fs=None, force_1ch=True, st
     noise_sample = read_audio(noise, force_1ch=force_1ch, fs=fs)[0]
     
     # add noise
-    snr = random.uniform(snr_min, snr_max)
-    noisy_speech, noise_sample = add_noise(speech_sample, noise_sample, snr=snr, rng=np.random.default_rng())
+    if random.random() < degradation_config["p_noise"]:
+        snr = random.uniform(degradation_config["snr_min"], degradation_config["snr_max"])
+        noisy_speech, noise_sample = add_noise(speech_sample, noise_sample, snr=snr, rng=np.random.default_rng())
+    else:
+        noisy_speech = speech_sample
     
     # add reverb
-    if rir is not None and random.random() < p_reverb:
+    if rir is not None and random.random() < degradation_config["p_reverb"]:
         rir_sample = read_audio(rir, force_1ch=force_1ch, fs=fs)[0]
         noisy_speech = add_reverberation(noisy_speech, rir_sample)
         early_rir_sample = estimate_early_rir(rir_sample, fs=fs)
@@ -278,13 +312,13 @@ def process_from_audio_path(speech, noise, rir=None, fs=None, force_1ch=True, st
     # noisy_speech, noise_sample = add_noise(noisy_speech, noise_sample, snr=snr, rng=np.random.default_rng())
     
     # add clipping
-    if random.random() < p_clipping:
-        noisy_speech = clipping(noisy_speech, min_quantile=clipping_min_quantile, max_quantile=clipping_max_quantile)
+    if random.random() < degradation_config["p_clipping"]:
+        noisy_speech = clipping(noisy_speech, min_quantile=degradation_config["clipping_min_quantile"], max_quantile=degradation_config["clipping_max_quantile"])
     
     # add bandwidth limitation
-    if random.random() < p_bandwidth_limitation:
-        fs_new = random.choice(bandwidth_limitation_rates)
-        res_type = random.choice(bandwidth_limitation_methods)
+    if random.random() < degradation_config["p_bandwidth_limitation"]:
+        fs_new = random.choice(degradation_config["bandwidth_limitation_rates"])
+        res_type = random.choice(degradation_config["bandwidth_limitation_methods"])
         noisy_speech = bandwidth_limitation(noisy_speech, fs=fs, fs_new=fs_new, res_type=res_type)
     
     # normalization

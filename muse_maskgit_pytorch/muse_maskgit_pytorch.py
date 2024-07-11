@@ -16,10 +16,11 @@ from einops import rearrange, repeat
 from beartype import beartype
 
 from muse_maskgit_pytorch.vqgan_vae import VQGanVAE
-from muse_maskgit_pytorch.t5 import t5_encode_text, get_encoded_dim, DEFAULT_T5_NAME
 from muse_maskgit_pytorch.attend import Attend
 
 from tqdm.auto import tqdm
+
+import pdb
 
 # helpers
 
@@ -233,7 +234,6 @@ class Transformer(nn.Module):
         dim,
         seq_len,
         dim_out = None,
-        t5_name = DEFAULT_T5_NAME,
         self_cond = False,
         add_mask_id = False,
         vq_layers = 1,
@@ -247,6 +247,9 @@ class Transformer(nn.Module):
         # self.token_emb = nn.Embedding(num_tokens + int(add_mask_id), dim)
         self.pos_emb = nn.Embedding(seq_len, dim)
         self.seq_len = seq_len
+        
+        # for classifier-free guidance
+        self.null_embed = nn.Parameter(torch.randn(dim))
 
         self.transformer_blocks = SelfTransformerBlocks(dim = dim, **kwargs)
         self.norm = LayerNorm(dim)
@@ -254,11 +257,6 @@ class Transformer(nn.Module):
         self.dim_out = default(dim_out, num_tokens)
         self.vq_layers = vq_layers
         self.to_logits = nn.ModuleList([nn.Linear(dim, self.dim_out, bias=False) for _ in range(vq_layers)])
-
-        # text conditioning
-        # self.encode_text = partial(t5_encode_text, name = t5_name)
-        # text_embed_dim = get_encoded_dim(t5_name)
-        # self.text_embed_proj = nn.Linear(text_embed_dim, dim, bias = False) if text_embed_dim != dim else nn.Identity() 
 
         # optional self conditioning
 
@@ -307,7 +305,8 @@ class Transformer(nn.Module):
 
     def forward(
         self,
-        x,
+        code_embeds: torch.Tensor,
+        audio_embeds: torch.Tensor,
         return_embed = False,
         return_logits = False,
         labels = None,
@@ -318,15 +317,23 @@ class Transformer(nn.Module):
         texts: Optional[List[str]] = None,
         text_embeds: Optional[torch.Tensor] = None
     ):
-        # new x: embedded input, shape: [b, n, dim]
-        device, b, n = x.device, x.shape[0], x.shape[1]
+        # code_embeds: [b, n, dim]
+        assert code_embeds.shape == audio_embeds.shape, 'code embeds and audio embeds must have the same shape, but got: {} and {}'.format(code_embeds.shape, audio_embeds.shape)
+        device, b, n = code_embeds.device, code_embeds.shape[0], code_embeds.shape[1]
         assert n <= self.seq_len
 
         # classifier free guidance
-
-        # if cond_drop_prob > 0.:
-        #     mask = prob_mask_like((b, 1), 1. - cond_drop_prob, device) # 用1 - cond_drop_prob是想要prob_mask_like函数输出False的概率为cond_drop_prob
-        #     context_mask = context_mask & mask
+        if cond_drop_prob > 0.:
+            # pdb.set_trace()
+            mask = prob_mask_like((b, 1), cond_drop_prob, device = device) # 想要输出True的概率是cond_drop_prob
+            # print("mask:", mask)
+            mask = mask.expand(b, n)
+            # mask with learnable null_embed
+            audio_embeds[mask] = self.null_embed
+            # print("audio_embeds.shape: ", audio_embeds.shape)
+            # print("audio_embeds: ", audio_embeds)
+        
+        x = code_embeds + audio_embeds
 
         # concat conditioning image token ids if needed
 
@@ -542,7 +549,7 @@ class MaskGit(nn.Module):
         token_critic: Optional[TokenCritic] = None,
         self_token_critic = False,
         vae: Optional[VQGanVAE] = None,
-        cond_drop_prob = 0.5,
+        cond_drop_prob = 0.1,
         self_cond_prob = 0.9,
         no_mask_token_prob = 0.,
         critic_loss_weight = 1.
@@ -657,10 +664,11 @@ class MaskGit(nn.Module):
             ], dim=1), dim=1) # [b, n, dim]
             audio_embeds = self.audio_encoder(noisy_audios) # [b, n, dim]
             
-            x = code_embeds + audio_embeds
+            # x = code_embeds + audio_embeds
 
             logits, embed = demask_fn(
-                x,
+                code_embeds,
+                audio_embeds,
                 self_cond_embed = self_cond_embed,
                 conditioning_token_ids = cond_ids,
                 cond_scale = cond_scale,
@@ -782,7 +790,7 @@ class MaskGit(nn.Module):
         audio_embeds = self.audio_encoder(noisy_audios) # [b, n, dim]
         # print("code_embeds.shape: ", code_embeds.shape)
         # print("audio_embeds.shape: ", audio_embeds.shape)
-        x = code_embeds + audio_embeds
+        # x = code_embeds + audio_embeds
 
         # get text embeddings
 
@@ -797,7 +805,8 @@ class MaskGit(nn.Module):
         if self.transformer.self_cond and random() < self.self_cond_prob:
             with torch.no_grad():
                 _, self_cond_embed = self.transformer(
-                    x,
+                    code_embeds,
+                    audio_embeds,
                     text_embeds = text_embeds,
                     conditioning_token_ids = None,
                     cond_drop_prob = 0.,
@@ -809,7 +818,8 @@ class MaskGit(nn.Module):
         # get loss
 
         ce_loss, logits = self.transformer(
-            x,
+            code_embeds,
+            audio_embeds,
             text_embeds = text_embeds,
             self_cond_embed = self_cond_embed,
             conditioning_token_ids = None,
@@ -838,53 +848,3 @@ class MaskGit(nn.Module):
         )
 
         return ce_loss + self.critic_loss_weight * bce_loss
-
-# final Muse class
-
-@beartype
-class Muse(nn.Module):
-    def __init__(
-        self,
-        base: MaskGit,
-        superres: MaskGit
-    ):
-        super().__init__()
-        self.base_maskgit = base.eval()
-
-        assert superres.resize_image_for_cond_image
-        self.superres_maskgit = superres.eval()
-
-    @torch.no_grad()
-    def forward(
-        self,
-        texts: List[str],
-        cond_scale = 3.,
-        temperature = 1.,
-        timesteps = 18,
-        superres_timesteps = None,
-        return_lowres = False,
-        return_pil_images = True
-    ):
-        lowres_image = self.base_maskgit.generate(
-            texts = texts,
-            cond_scale = cond_scale,
-            temperature = temperature,
-            timesteps = timesteps
-        )
-
-        superres_image = self.superres_maskgit.generate(
-            texts = texts,
-            cond_scale = cond_scale,
-            cond_images = lowres_image,
-            temperature = temperature,
-            timesteps = default(superres_timesteps, timesteps)
-        )
-        
-        if return_pil_images:
-            lowres_image = list(map(T.ToPILImage(), lowres_image))
-            superres_image = list(map(T.ToPILImage(), superres_image))            
-
-        if not return_lowres:
-            return superres_image
-
-        return superres_image, lowres_image

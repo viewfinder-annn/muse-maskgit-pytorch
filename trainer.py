@@ -11,6 +11,7 @@ import dac
 import random
 from transformers import get_scheduler as get_transformers_scheduler
 from torch.utils.tensorboard import SummaryWriter
+from dataset.degradation_dataset import AudioDegradationDataset
 
 def pad_or_truncate(x, length=512*256):
     if x.size(-1) < length:
@@ -48,8 +49,9 @@ class AudioDataset(Dataset):
         return clean_signal, noisy_signal
 
 def get_dataloader(config, device):
-    dataset = AudioDataset(data_path=config['train_data_path'], sr=config['sample_rate'], device=device)
-    dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True)
+    dataset = AudioDegradationDataset(speech_list=config['train']['speech_list'], noise_list=config['train']['noise_list'], rir_list=config['train']['rir_list'], degradation_config=config['degradation_config'], seq_len=512*256, sr=44100, device=device)
+    dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'])
+    # TODO: val dataset
     return dataloader
 
 def get_model(config, device):
@@ -105,19 +107,24 @@ def get_scheduler(optimizer, config):
     else:
         raise NotImplementedError(f"Scheduler {config['scheduler']} not implemented")
 
-def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs=10, test_noisy_path=None, save_every=5):
+def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs=10, test_noisy_path=None, save_every_step=1000, eval_every_step=1000):
     model_dst = f'./exp/{exp_name}/model'
     os.makedirs(model_dst, exist_ok=True)
     audio_dst = f'./exp/{exp_name}/output'
     os.makedirs(audio_dst, exist_ok=True)
     
     input_noisy_paths = random.sample([os.path.join(test_noisy_path, f) for f in os.listdir(test_noisy_path) if f.endswith('.wav')], 10)
-    
+
     writer = SummaryWriter(f'./exp/{exp_name}/logs')
+    global_step = 0
+    save_part_loss = 0
+    eval_part_loss = 0
+    
+    if epochs < 0:
+        epochs = int(1e9)
     
     for epoch in range(epochs):
         sum_loss = 0
-        part_loss = 0
         model.train()
         for batch_idx, (clean_signals, noisy_signals) in tqdm(enumerate(dataloader), total=len(dataloader)):
             clean_signals = clean_signals.to(device)
@@ -134,41 +141,43 @@ def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs
             writer.add_scalar('Step/lr', optimizer.param_groups[0]['lr'], epoch*len(dataloader)+batch_idx)
             
             sum_loss += loss.item()
-            part_loss += loss.item()
+            save_part_loss += loss.item()
+            eval_part_loss += loss.item()
+            global_step += 1
             
-            if batch_idx % 10 == 0:
-                print(f"Epoch {epoch}, Batch {batch_idx}, Part Loss: {part_loss/10}, Avg Loss: {sum_loss/(batch_idx+1)}")
-                part_loss = 0
+            if global_step % eval_every_step == 0:
+                if input_noisy_paths is not None:
+                    with torch.no_grad():
+                        noisy_audios = []
+                        for input_path in input_noisy_paths:
+                            signal, sr = torchaudio.load(input_path)
+                            signal = signal.to(device)
+                            # resample to 44.1k
+                            signal = torchaudio.transforms.Resample(sr, 44100).to(device)(signal)
+                            # print(signal.shape, signal.device)
+                            signal = pad_or_truncate(signal)
+                            noisy_audios.append(signal)
+                        noisy_audios = torch.stack(noisy_audios)
+                        noisy_audios.squeeze_(1)
+                        noisy_audios = noisy_audios.to(device)
+                        ids, clean_audios = model.generate(noisy_audios, timesteps=40)
+                        output_dir = f'{audio_dst}/epoch-{epoch}-step-{global_step}-loss-{eval_part_loss/eval_every_step}'
+                        os.makedirs(output_dir, exist_ok=True)
+                        for i in range(10):
+                            # print(clean_audios[i].shape, noisy_audios[i].shape)
+                            torchaudio.save(f'{output_dir}/noisy_{i}_enhanced.wav', clean_audios[i].detach().cpu(), 44100)
+                            torchaudio.save(f'{output_dir}/noisy_{i}.wav', noisy_audios[i].unsqueeze(0).detach().cpu(), 44100)
+                eval_part_loss = 0
+            
+            if global_step % save_every_step == 0:
+                print(f"Epoch {epoch} Step {global_step} Loss: {save_part_loss/save_every_step}")
+                model_name = f"epoch-{epoch}-step-{global_step}-loss-{save_part_loss/save_every_step}.pt"
+                model.save(f'{model_dst}/{model_name}')
+                save_part_loss = 0
         
         # add epoch loss to tensorboard
         writer.add_scalar('Epoch/loss', sum_loss/len(dataloader), epoch)
         print(f"Epoch {epoch} Finished, Avg Loss: {sum_loss/len(dataloader)}")
-        
-        if epoch % save_every == 0:
-            model_name = f"epoch-{epoch}-loss-{sum_loss/len(dataloader)}.pt"
-            model.save(f'{model_dst}/{model_name}')
-        
-        if input_noisy_paths is not None:
-            with torch.no_grad():
-                noisy_audios = []
-                for input_path in input_noisy_paths:
-                    signal, sr = torchaudio.load(input_path)
-                    signal = signal.to(device)
-                    # resample to 44.1k
-                    signal = torchaudio.transforms.Resample(sr, 44100).to(device)(signal)
-                    # print(signal.shape, signal.device)
-                    signal = pad_or_truncate(signal)
-                    noisy_audios.append(signal)
-                noisy_audios = torch.stack(noisy_audios)
-                noisy_audios.squeeze_(1)
-                noisy_audios = noisy_audios.to(device)
-                ids, clean_audios = model.generate(noisy_audios, timesteps=40)
-                output_dir = f'{audio_dst}/epoch-{epoch}-loss-{sum_loss/len(dataloader)}'
-                os.makedirs(output_dir, exist_ok=True)
-                for i in range(10):
-                    print(clean_audios[i].shape, noisy_audios[i].shape)
-                    torchaudio.save(f'{output_dir}/noisy_{i}_enhanced.wav', clean_audios[i].detach().cpu(), 44100)
-                    torchaudio.save(f'{output_dir}/noisy_{i}.wav', noisy_audios[i].unsqueeze(0).detach().cpu(), 44100)
     
     writer.close()  # 关闭Writer
     return model
@@ -187,7 +196,7 @@ def main(config_path):
     model = get_model(config['model'], device)
     optimizer = get_optimizer(model, config['train'])
     scheduler = get_scheduler(optimizer, config['train'])
-    model = train_loop(exp_name, model, dataloader, optimizer, scheduler, device, config['train']['epochs'], config['dataset']['test_noisy_path'], config['train']['save_every'])
+    model = train_loop(exp_name, model, dataloader, optimizer, scheduler, device, config['train']['epochs'], config['dataset']['test_noisy_path'], config['train']['save_every_step'], config['train']['eval_every_step'])
     return model
 
 if __name__ == '__main__':
