@@ -3,7 +3,9 @@ import torch
 import os
 from tqdm import tqdm
 import json5
+import json
 from trainer import pad_or_truncate, get_model
+import time
 
 def load_model(model_path, config, device):
     model = get_model(config['model'], device)  # get_model needs to be defined or imported appropriately
@@ -80,7 +82,10 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    model_name = os.path.basename(args.model).replace('.pt', '')
-    output_folder = os.path.join(args.exp, 'infer', model_name)
+    # TODO: Add a timestamp to the output folder name, and metadata about the model/data used for inference
+    output_folder = os.path.join(args.exp, 'infer', time.strftime('%Y%m%d-%H:%M'))
+    os.makedirs(output_folder, exist_ok=True)
+    with open(os.path.join(output_folder, 'metadata.json'), 'w') as f:
+        json.dump(vars(args), f, indent=4)
     
     main(args.model, args.config, args.input_folder, output_folder)

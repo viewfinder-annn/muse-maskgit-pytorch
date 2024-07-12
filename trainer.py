@@ -1,16 +1,18 @@
-import torchaudio
-import torch
-from muse_maskgit_pytorch import MaskGit, MaskGitTransformer, AudioEncoder
-from torch.utils.data import Dataset, DataLoader
 import os
-from tqdm import tqdm
-import json5
 import json
 import time
-import dac
 import random
-from transformers import get_scheduler as get_transformers_scheduler
+import json5
+import torch
+import torchaudio
+import dac
+import argparse
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from accelerate import Accelerator, DistributedType
+from transformers import get_scheduler as get_transformers_scheduler
+from muse_maskgit_pytorch import MaskGit, MaskGitTransformer, AudioEncoder
 from dataset.degradation_dataset import AudioDegradationDataset
 
 def pad_or_truncate(x, length=512*256):
@@ -107,22 +109,40 @@ def get_scheduler(optimizer, config):
     else:
         raise NotImplementedError(f"Scheduler {config['scheduler']} not implemented")
 
-def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs=10, test_noisy_path=None, save_every_step=1000, eval_every_step=1000):
+def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs=10, test_noisy_path=None, save_every_step=1000, eval_every_step=1000, resume_path=None):
+    # accelerator = Accelerator()
+    # model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    
+    print(f"train_loop {resume_path}")
+    
     model_dst = f'./exp/{exp_name}/model'
     os.makedirs(model_dst, exist_ok=True)
     audio_dst = f'./exp/{exp_name}/output'
     os.makedirs(audio_dst, exist_ok=True)
     
     input_noisy_paths = random.sample([os.path.join(test_noisy_path, f) for f in os.listdir(test_noisy_path) if f.endswith('.wav')], 10)
-
     writer = SummaryWriter(f'./exp/{exp_name}/logs')
-    global_step = 0
-    save_part_loss = 0
-    eval_part_loss = 0
     
     if epochs < 0:
         epochs = int(1e9)
+
+    if resume_path is not None:
+        print(f"Resuming training from {resume_path}")
+        resume_model_name = resume_path.split('/')[-1]
+        # epoch-0-step-1000-loss-6.531188071727753
+        epoch = int(resume_model_name.split('-')[1])
+        global_step = int(resume_model_name.split('-')[3])
+        epochs = epochs - epoch
+        model.load_state_dict(torch.load(os.path.join(resume_path, 'model.pt')))
+        optimizer.load_state_dict(torch.load(os.path.join(resume_path, 'optimizer.pt')))
+        if os.path.exists(os.path.join(resume_path, 'scheduler.pt')):
+            scheduler.load_state_dict(torch.load(os.path.join(resume_path, 'scheduler.pt')))
+    else:
+        global_step = 0
     
+    save_part_loss = 0
+    eval_part_loss = 0
+
     for epoch in range(epochs):
         sum_loss = 0
         model.train()
@@ -137,14 +157,14 @@ def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs
             optimizer.zero_grad()
             
             # add step lr & loss to tensorboard
-            writer.add_scalar('Step/loss', loss.item(), epoch*len(dataloader)+batch_idx)
-            writer.add_scalar('Step/lr', optimizer.param_groups[0]['lr'], epoch*len(dataloader)+batch_idx)
-            
+            writer.add_scalar('Step/loss', loss.item(), global_step)
+            writer.add_scalar('Step/lr', optimizer.param_groups[0]['lr'], global_step)
+
             sum_loss += loss.item()
             save_part_loss += loss.item()
             eval_part_loss += loss.item()
             global_step += 1
-            
+
             if global_step % eval_every_step == 0:
                 if input_noisy_paths is not None:
                     with torch.no_grad():
@@ -154,7 +174,6 @@ def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs
                             signal = signal.to(device)
                             # resample to 44.1k
                             signal = torchaudio.transforms.Resample(sr, 44100).to(device)(signal)
-                            # print(signal.shape, signal.device)
                             signal = pad_or_truncate(signal)
                             noisy_audios.append(signal)
                         noisy_audios = torch.stack(noisy_audios)
@@ -164,25 +183,29 @@ def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs
                         output_dir = f'{audio_dst}/epoch-{epoch}-step-{global_step}-loss-{eval_part_loss/eval_every_step}'
                         os.makedirs(output_dir, exist_ok=True)
                         for i in range(10):
-                            # print(clean_audios[i].shape, noisy_audios[i].shape)
                             torchaudio.save(f'{output_dir}/noisy_{i}_enhanced.wav', clean_audios[i].detach().cpu(), 44100)
                             torchaudio.save(f'{output_dir}/noisy_{i}.wav', noisy_audios[i].unsqueeze(0).detach().cpu(), 44100)
                 eval_part_loss = 0
-            
+
             if global_step % save_every_step == 0:
                 print(f"Epoch {epoch} Step {global_step} Loss: {save_part_loss/save_every_step}")
-                model_name = f"epoch-{epoch}-step-{global_step}-loss-{save_part_loss/save_every_step}.pt"
-                model.save(f'{model_dst}/{model_name}')
+                model_name = f"epoch-{epoch}-step-{global_step}-loss-{save_part_loss/save_every_step}"
+                save_path = os.path.join(model_dst, model_name)
+                os.makedirs(save_path, exist_ok=True)
+                torch.save(model.state_dict(), os.path.join(save_path, 'model.pt'))
+                torch.save(optimizer.state_dict(), os.path.join(save_path, 'optimizer.pt'))
+                torch.save(scheduler.state_dict(), os.path.join(save_path, 'scheduler.pt'))
                 save_part_loss = 0
-        
+
         # add epoch loss to tensorboard
         writer.add_scalar('Epoch/loss', sum_loss/len(dataloader), epoch)
         print(f"Epoch {epoch} Finished, Avg Loss: {sum_loss/len(dataloader)}")
-    
-    writer.close()  # 关闭Writer
+
+    writer.close()
     return model
 
-def main(config_path):
+def main(config_path, resume_path=None):
+    print(f"main {resume_path}")
     # Load configuration
     with open(config_path, 'r') as f:
         config = json5.load(f)
@@ -196,13 +219,13 @@ def main(config_path):
     model = get_model(config['model'], device)
     optimizer = get_optimizer(model, config['train'])
     scheduler = get_scheduler(optimizer, config['train'])
-    model = train_loop(exp_name, model, dataloader, optimizer, scheduler, device, config['train']['epochs'], config['dataset']['test_noisy_path'], config['train']['save_every_step'], config['train']['eval_every_step'])
+    model = train_loop(exp_name, model, dataloader, optimizer, scheduler, device, config['train']['epochs'], config['dataset']['test_noisy_path'], config['train']['save_every_step'], config['train']['eval_every_step'], resume_path)
     return model
 
 if __name__ == '__main__':
-    import argparse
     parser = argparse.ArgumentParser(description='Train a model based on the given configuration file.')
     parser.add_argument('--config', type=str, required=True, help='Path to the configuration file.')
+    parser.add_argument('--resume_path', type=str, default=None, help='Path to the model to resume training from.')
     args = parser.parse_args()
-
-    main(args.config)
+    print(f"args {args}")
+    main(args.config, args.resume_path)
