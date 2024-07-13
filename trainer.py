@@ -14,6 +14,7 @@ from accelerate import Accelerator, DistributedType
 from transformers import get_scheduler as get_transformers_scheduler
 from muse_maskgit_pytorch import MaskGit, MaskGitTransformer, AudioEncoder
 from dataset.degradation_dataset import AudioDegradationDataset
+from dataset.sing2song_dataset import Sing2SongDataset
 
 def pad_or_truncate(x, length=512*256):
     if x.size(-1) < length:
@@ -51,14 +52,23 @@ class AudioDataset(Dataset):
         return clean_signal, noisy_signal
 
 def get_dataloader(config, device):
+    if 'task' in config and config['task'] == 'sing2song':
+        dataset = Sing2SongDataset(metadatas=config['train']['metadatas'], seq_len=config['train']['seq_len'], sr=config['sample_rate'], device=device, num_samples=config['train']['num_samples'])
+        dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'])
+        return dataloader
+        
     dataset = AudioDegradationDataset(speech_list=config['train']['speech_list'], noise_list=config['train']['noise_list'], rir_list=config['train']['rir_list'], degradation_config=config['degradation_config'], seq_len=512*256, sr=44100, device=device)
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'])
     # TODO: val dataset
     return dataloader
 
 def get_model(config, device):
-    # Load DAC model
-    dac_model = dac.DAC.load(config['dac_path']).to(device)
+    if 'vq_model_type' in config and config['vq_model_type'] == 'encodec':
+        from transformers import EncodecModel
+        dac_model = EncodecModel.from_pretrained("facebook/encodec_32khz")
+    else:
+        # Load DAC model
+        dac_model = dac.DAC.load(config['dac_path']).to(device)
     dac_model.to(device)
     dac_model.eval()
     dac_model.requires_grad_(False)
@@ -77,6 +87,8 @@ def get_model(config, device):
         audio_encoder=audio_encoder,
         **maskgit_config
     ).to(device)
+    
+    print('Model Parameters:', sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6, 'M')
 
     return model
 
@@ -173,8 +185,8 @@ def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs
                             signal, sr = torchaudio.load(input_path)
                             signal = signal.to(device)
                             # resample to 44.1k
-                            signal = torchaudio.transforms.Resample(sr, 44100).to(device)(signal)
-                            signal = pad_or_truncate(signal)
+                            signal = torchaudio.transforms.Resample(sr, 32000).to(device)(signal)
+                            signal = pad_or_truncate(signal, length=32000*10)
                             noisy_audios.append(signal)
                         noisy_audios = torch.stack(noisy_audios)
                         noisy_audios.squeeze_(1)
@@ -183,8 +195,8 @@ def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs
                         output_dir = f'{audio_dst}/epoch-{epoch}-step-{global_step}-loss-{eval_part_loss/eval_every_step}'
                         os.makedirs(output_dir, exist_ok=True)
                         for i in range(10):
-                            torchaudio.save(f'{output_dir}/noisy_{i}_enhanced.wav', clean_audios[i].detach().cpu(), 44100)
-                            torchaudio.save(f'{output_dir}/noisy_{i}.wav', noisy_audios[i].unsqueeze(0).detach().cpu(), 44100)
+                            torchaudio.save(f'{output_dir}/noisy_{i}_enhanced.wav', clean_audios[i].detach().cpu(), 32000)
+                            torchaudio.save(f'{output_dir}/noisy_{i}.wav', noisy_audios[i].unsqueeze(0).detach().cpu(), 32000)
                 eval_part_loss = 0
 
             if global_step % save_every_step == 0:

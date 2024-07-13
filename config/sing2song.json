@@ -1,0 +1,77 @@
+{
+    "dataset": {
+        "task": "sing2song",
+        "sample_rate": 32000,
+        "batch_size": 24,
+        "num_workers": 4,
+        "train": {
+            "metadatas": [
+                "/mnt/data2/zhangjunan/sing2song_challenge/netease/dataset/chinese_short/train.json",
+                "/mnt/data2/zhangjunan/sing2song_challenge/netease/dataset/english_short/train.json",
+            ],
+            "seq_len": 10,
+            "num_samples": 200000,
+        },
+        // "test": {
+        //     "metadatas": [
+        //         "/mnt/data2/zhangjunan/sing2song_challenge/netease/dataset/chinese_short/test.json",
+        //         "/mnt/data2/zhangjunan/sing2song_challenge/netease/dataset/english_short/test.json",
+        //     ],
+        //     "seq_len": 10,
+        //     "num_samples": 20,
+        // }
+        "test_noisy_path": "/mnt/data2/zhangjunan/sing2song_challenge/muse-maskgit-pytorch/dataset/test_audio/testset",
+    },
+    "model": {
+        "vq_model_type": "encodec",
+        "vq_model_path": "/mnt/data2/zhangjunan/muse-maskgit-pytorch/pretrained/weights.pth",
+        "MaskGitTransformer": {
+            "num_tokens": 2048,
+            "seq_len": 500,
+            "dim": 768,
+            "depth": 8,
+            "dim_head": 64,
+            "heads": 8,
+            "ff_mult": 4,
+            "vq_layers": 4
+        },
+        "AudioEncoder": {
+            "dim": 768,
+            "input_dim": 1025,
+            "n_fft": 2048,
+            "hop_length": 640, // 20ms
+            "win_length": 2048,
+            "mlp_layers": [
+                1024,
+                768
+            ],
+            "transformer_layers": 6,
+        },
+        "MaskGit": {
+            "seq_len": 500,
+            "vq_layers": 4,
+            "vq_model_type": "encodec",
+            "cond_drop_prob": 0.1,
+        }
+    },
+    "train": {
+        "device": "cuda",
+        "epochs": -1, // -1 means infinite
+        "optimizer": "adam",
+        "adam": {
+            "betas": [
+                0.9,
+                0.98
+            ],
+            "eps": 1e-09
+        },
+        "scheduler": "linear",
+        "linear": {
+            "num_warmup_steps": 4000,
+            "num_training_steps": 400000
+        },
+        "learning_rate": 1e-04,
+        "save_every_step": 5000,
+        "eval_every_step": 100,
+    }
+}

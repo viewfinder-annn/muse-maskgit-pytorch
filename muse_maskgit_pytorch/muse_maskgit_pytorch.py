@@ -22,6 +22,21 @@ from tqdm.auto import tqdm
 
 import pdb
 
+# sinusoidal positional encoding
+# class SinusoidalPosEmb(nn.Module):
+#     def __init__(self, dim):
+#         super().__init__()
+#         self.dim = dim
+
+#     def forward(self, x):
+#         device = x.device
+#         half_dim = self.dim // 2
+#         emb = math.log(10000) / (half_dim - 1)
+#         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+#         emb = x[:, None] * emb[None, :] * 1.0
+#         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+#         return emb
+
 # helpers
 
 def exists(val):
@@ -245,6 +260,7 @@ class Transformer(nn.Module):
 
         self.num_tokens = num_tokens
         # self.token_emb = nn.Embedding(num_tokens + int(add_mask_id), dim)
+        # TODO: arbitrary positional embedding for variable length sequences
         self.pos_emb = nn.Embedding(seq_len, dim)
         self.seq_len = seq_len
         
@@ -552,7 +568,8 @@ class MaskGit(nn.Module):
         cond_drop_prob = 0.1,
         self_cond_prob = 0.9,
         no_mask_token_prob = 0.,
-        critic_loss_weight = 1.
+        critic_loss_weight = 1.,
+        vq_model_type = 'dac',
     ):
         super().__init__()
         self.vae = vae.copy_for_eval() if exists(vae) else None
@@ -561,6 +578,7 @@ class MaskGit(nn.Module):
         self.vq_layers = vq_layers
         
         self.vq_model = vq_model
+        self.vq_model_type = vq_model_type
 
         self.cond_drop_prob = cond_drop_prob
 
@@ -724,16 +742,38 @@ class MaskGit(nn.Module):
         return ids, audios
 
     def encode(self, clean_audios: torch.Tensor):
-        with torch.no_grad():
-            x = self.vq_model.preprocess(clean_audios, 44100)
-            z, codes, latents, _, _ = self.vq_model.encode(x)
-        return codes
+        if self.vq_model_type == 'dac':
+            with torch.no_grad():
+                x = self.vq_model.preprocess(clean_audios, 44100)
+                z, codes, latents, _, _ = self.vq_model.encode(x)
+            return codes
+        elif self.vq_model_type == 'encodec':
+            with torch.no_grad():
+                x = clean_audios.unsqueeze(1) # [b, n] -> [b, 1, n]
+                codes = self.vq_model.encode(x).audio_codes # [1, b, vq_layers, n]
+                # print(codes.shape)
+                codes = codes.squeeze(0) # [b, vq_layers, n]
+            return codes
 
     def decode(self, codes: torch.Tensor):
-        with torch.no_grad():
-            z_q, _, _ = self.vq_model.quantizer.from_codes(codes)
-            audios = self.vq_model.decode(z_q)
-        return audios
+        if self.vq_model_type == 'dac':
+            with torch.no_grad():
+                z_q, _, _ = self.vq_model.quantizer.from_codes(codes)
+                audios = self.vq_model.decode(z_q)
+            return audios
+        elif self.vq_model_type == 'encodec':
+            with torch.no_grad():
+                codes = codes.unsqueeze(1) # [b, vq_layers, n] -> [b, 1, vq_layers, n]
+                audio_scales = [None]
+                audios = []
+                for code in codes:
+                    print("code.shape: ", code.shape)
+                    code.unsqueeze_(0) # [1, 1, vq_layers, n]
+                    audio = self.vq_model.decode(code, audio_scales).audio_values # [1, 1, n]
+                    audios.append(audio)
+                audios = torch.cat(audios, dim=0) # [b, 1, n]
+                print("audios.shape: ", audios.shape)
+            return audios
 
     def forward(
         self,
@@ -747,14 +787,14 @@ class MaskGit(nn.Module):
         sample_temperature = None
     ):
         '''
-        audio_codes: [batch, audio_len]
+        clean_audios: [batch, audio_len]
         noisy_audios: [batch, audio_len]
         '''
         
         audio_codes = self.encode(clean_audios)
         
         # get some basic variables
-        assert len(audio_codes.shape) == 3
+        assert len(audio_codes.shape) == 3, f"audio_codes should have shape [batch, vq_layers, seq_len], got {audio_codes.shape}"
         assert audio_codes.shape[1] == self.vq_layers
         assert audio_codes.shape[2] == self.seq_len
         ids = rearrange(audio_codes, 'b ... -> b (...)') # [b, vq_layers, n] -> [b, vq_layers*n]
