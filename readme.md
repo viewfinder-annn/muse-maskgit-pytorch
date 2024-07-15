@@ -1,5 +1,5 @@
 ```sh
-python3 -m pip install git+https://github.com/facebookresearch/WavAugment.git
+# python3 -m pip install git+https://github.com/facebookresearch/WavAugment.git
 conda install -y sox -c conda-forge
 
 mkdir pretrained

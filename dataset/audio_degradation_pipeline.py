@@ -335,12 +335,101 @@ def process_from_audio_path(speech, noise, rir=None, fs=None, force_1ch=True, de
     return speech_sample, noise_sample, noisy_speech, fs
     
 if __name__ == "__main__":
-    speech = './test_audio/p232_006.wav'
-    noise = './test_audio/p234_001_44.wav'
-    rir = './test_audio/rir_2.wav'
+    # speech = './test_audio/p232_006.wav'
+    # noise = './test_audio/p234_001_44.wav'
+    # rir = './test_audio/rir_2.wav'
     
-    speech_sample, noise_sample, noisy_speech, fs = process_from_audio_path(speech, noise, rir)
+    # speech_sample, noise_sample, noisy_speech, fs = process_from_audio_path(speech, noise, rir)
     
-    save_audio(speech_sample, './test_audio/output/speech_sample.wav', fs)
-    save_audio(noise_sample, './test_audio/output/noise_sample.wav', fs)
-    save_audio(noisy_speech, './test_audio/output/noisy_speech.wav', fs)
+    # save_audio(speech_sample, './test_audio/output/speech_sample.wav', fs)
+    # save_audio(noise_sample, './test_audio/output/noise_sample.wav', fs)
+    # save_audio(noisy_speech, './test_audio/output/noisy_speech.wav', fs)
+    
+    import os
+    import glob
+    def get_list(speech_list, noise_list, rir_list, root):
+        def parse_file(file_path):
+            list_paths = []
+            with open(file_path, 'r') as file:
+                for line in file:
+                    # 使用split()分割行，并取最后一个元素作为路径
+                    rel_path = line.strip().split()[-1]
+                    
+                    # urgent challenge bug
+                    if 'wsj0_wav' in rel_path:
+                        rel_path = rel_path.replace('wsj0_wav', 'wsj0_wav/csr_1')
+                    if 'wsj1_wav' in rel_path:
+                        rel_path = rel_path.replace('wsj1_wav', 'wsj1_wav/csr_2_comp')
+                    
+                    # 将根路径与相对路径合并，形成完整路径
+                    full_path =  os.path.normpath(os.path.join(root, rel_path))
+                    list_paths.append(full_path)
+            return list_paths
+
+        speech_paths = parse_file(speech_list)
+        noise_paths = parse_file(noise_list)
+        rir_paths = parse_file(rir_list) if rir_list else None
+
+        return speech_paths, noise_paths, rir_paths
+    
+    speech_list = "/mnt/data2/zhangjunan/urgent2024_challenge/data/noise_train.scp"
+    noise_list = "/mnt/data2/zhangjunan/urgent2024_challenge/data/noise_train.scp"
+    rir_list = "/mnt/data2/zhangjunan/urgent2024_challenge/data/rir_train.scp"
+    
+    speech_list, noise_list, rir_list = get_list(speech_list, noise_list, rir_list, '/mnt/data2/zhangjunan/urgent2024_challenge/')
+    src = '/mnt/data3/share/svc-data/vocalist'
+    speech_list = glob.glob(os.path.join(src, '**/*.wav'), recursive=True)
+    
+    degradation_config = {
+            "p_noise": 1.0,
+            "snr_min": -5,
+            "snr_max": 20,
+            
+            "p_reverb": 0.5,
+            
+            "p_clipping": 0.25,
+            "clipping_min_quantile": 0.06,
+            "clipping_max_quantile": 0.9,
+            
+            "p_bandwidth_limitation": 0.5,
+            "bandwidth_limitation_rates": [
+                1000,
+                2000,
+                4000,
+                8000,
+                16000,
+                22050,
+                32000,
+            ],
+            "bandwidth_limitation_methods": [
+                "kaiser_best",
+                "kaiser_fast",
+                "scipy",
+                "polyphase",
+            ],
+        }
+    
+    import random
+    from tqdm import tqdm
+    speech_paths = random.sample(speech_list, 200)
+    dst = '/mnt/data2/zhangjunan/enhancement/data/singing_scp/testset'
+    
+    os.makedirs(os.path.join(dst, 'clean'), exist_ok=True)
+    os.makedirs(os.path.join(dst, 'noisy'), exist_ok=True)
+    for speech_path in tqdm(speech_paths):
+        noise_path = random.choice(noise_list)
+        rir_path = random.choice(rir_list) if rir_list else None
+        # print(f"speech_path: {speech_path}, noise_path: {noise_path}, rir_path: {rir_path}")
+        
+        speech_sample, noise_sample, noisy_speech, fs = process_from_audio_path(
+            speech=speech_path, 
+            noise=noise_path, 
+            rir=rir_path, 
+            fs=44100, 
+            force_1ch=True,
+            degradation_config=degradation_config
+        )
+        filename = '-'.join(speech_path.split('/')[-3:])
+        save_audio(speech_sample, os.path.join(dst, 'clean', filename), fs)
+        save_audio(noisy_speech, os.path.join(dst, 'noisy', filename), fs)
+    

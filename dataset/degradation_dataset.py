@@ -32,8 +32,13 @@ class AudioDegradationDataset(Dataset):
                     full_path =  os.path.normpath(os.path.join(root, rel_path))
                     list_paths.append(full_path)
             return list_paths
-
-        speech_paths = parse_file(speech_list)
+        
+        if 'singing_scp' in speech_list:
+            # 找到第一个空格，之后的内容全部是路径
+            speech_paths = [i.split(' ', 1)[1].strip()
+                            for i in open(speech_list, 'r').readlines()]
+        else:
+            speech_paths = parse_file(speech_list)
         noise_paths = parse_file(noise_list)
         rir_paths = parse_file(rir_list) if rir_list else None
 

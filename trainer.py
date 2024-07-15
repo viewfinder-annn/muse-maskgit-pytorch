@@ -120,7 +120,7 @@ def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs
     audio_dst = f'./exp/{exp_name}/output'
     os.makedirs(audio_dst, exist_ok=True)
     
-    input_noisy_paths = random.sample([os.path.join(test_noisy_path, f) for f in os.listdir(test_noisy_path) if f.endswith('.wav')], 10)
+    input_noisy_paths = random.sample([os.path.join(test_noisy_path, f) for f in os.listdir(test_noisy_path) if f.endswith('.wav')], 20)
     writer = SummaryWriter(f'./exp/{exp_name}/logs')
     
     if epochs < 0:
