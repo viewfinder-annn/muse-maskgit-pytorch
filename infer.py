@@ -20,7 +20,8 @@ def infer(model, input_folder, output_folder, device):
     os.makedirs(enhanced_dir, exist_ok=True)
     os.makedirs(noisy_dir, exist_ok=True)
 
-    file_list = [f for f in os.listdir(input_folder) if f.endswith('.wav')]
+    file_list = [f for f in os.listdir(input_folder) if f.endswith('.wav') or f.endswith('.flac') or f.endswith('.mp3')]
+    assert len(file_list) > 0, f"No audio files found in {input_folder}."
     
     window_size = 512 * 256  # 窗口大小
 
@@ -61,16 +62,43 @@ def infer(model, input_folder, output_folder, device):
         enhanced_signal = enhanced_signal[:, :original_length]
 
         # 保存增强的音频和原始噪声音频
-        output_file_path = os.path.join(enhanced_dir, file_name)
+        output_file_path = os.path.join(enhanced_dir, file_name.split('.')[0] + '.wav')
         torchaudio.save(output_file_path, enhanced_signal.detach().cpu(), 44100)
         torchaudio.save(os.path.join(noisy_dir, file_name), signal.detach().cpu(), 44100)
-        print(f"Processed {file_name} -> {output_file_path}")
+        # print(f"Processed {file_name} -> {output_file_path}")
 
-def main(model_path, config_path, input_folder, output_folder):
+def main(model_path, config_path, input_folder, exp, resample=None, dnsmos=False):
+
+    model_dir = os.path.split(os.path.dirname(model_path))[-1]
+    output_folder = os.path.join(exp, 'infer', model_dir, time.strftime('%Y%m%d-%H:%M:%S'))
+    os.makedirs(output_folder, exist_ok=True)
+    with open(os.path.join(output_folder, 'metadata.json'), 'w') as f:
+        # json.dump(vars(args), f, indent=4)
+        json.dump({'model_path': model_path, 'config_path': config_path, 'input_folder': input_folder, 'output_folder': output_folder, 'resample': resample, 'dnsmos': dnsmos}, f, indent=4)
+
     config = json5.load(open(config_path))
     device = config['train']['device']
     model = load_model(model_path, config, device)
     infer(model, input_folder, output_folder, device)
+    
+    final_output_folder = os.path.join(output_folder, 'enhanced')
+    
+    if resample is not None:
+        import librosa
+        import soundfile as sf
+        print(f"Resampling output to {resample} Hz...")
+        original_output_folder = os.path.join(output_folder, 'enhanced')
+        file_list = [f for f in os.listdir(original_output_folder) if f.endswith('.wav')]
+        resampled_output_folder = os.path.join(output_folder, f'enhanced_{resample}')
+        os.makedirs(resampled_output_folder, exist_ok=True)
+        for file_name in tqdm(file_list):
+            y, sr = librosa.load(os.path.join(original_output_folder, file_name), sr=None)
+            y_resampled = librosa.resample(y, orig_sr=sr, target_sr=resample)
+            sf.write(os.path.join(resampled_output_folder, file_name), y_resampled, resample)
+        final_output_folder = resampled_output_folder
+    if dnsmos:
+        from evaluation.dnsmos import calculate_dnsmos_score
+        calculate_dnsmos_score(final_output_folder, './evaluation/DNSMOS', csv_path=os.path.join(output_folder, 'dnsmos.csv'))
 
 if __name__ == "__main__":
     import argparse
@@ -79,13 +107,9 @@ if __name__ == "__main__":
     parser.add_argument('--model', type=str, required=True, help='Path to the trained model file.')
     parser.add_argument('--config', type=str, required=True, help='Path to the model configuration file.')
     parser.add_argument('--input_folder', type=str, required=True, help='Folder containing input audio files.')
+    parser.add_argument('--resample', type=int, default=None, help='Resample input audio to this rate before inference.')
+    parser.add_argument('--dnsmos', action='store_true', help='Compute DNSMOS scores for the output audio.')
     
     args = parser.parse_args()
     
-    # TODO: Add a timestamp to the output folder name, and metadata about the model/data used for inference
-    output_folder = os.path.join(args.exp, 'infer', time.strftime('%Y%m%d-%H:%M'))
-    os.makedirs(output_folder, exist_ok=True)
-    with open(os.path.join(output_folder, 'metadata.json'), 'w') as f:
-        json.dump(vars(args), f, indent=4)
-    
-    main(args.model, args.config, args.input_folder, output_folder)
+    main(args.model, args.config, args.input_folder, args.exp, args.resample, args.dnsmos)
