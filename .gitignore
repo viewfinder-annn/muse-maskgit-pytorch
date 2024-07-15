@@ -131,4 +131,5 @@ dmypy.json
 /output/
 /model/
 /exp/
+/pretrained/
 /dataset/test_audio/
