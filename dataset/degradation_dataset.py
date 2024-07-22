@@ -1,3 +1,5 @@
+import sys
+sys.path.append('../')
 import os
 import torch
 from torch.utils.data import Dataset
@@ -76,19 +78,59 @@ class AudioDegradationDataset(Dataset):
 
     def pad_or_truncate(self, clean, noisy):
         if clean.size(-1) < self.seq_len:
-            clean = torch.nn.functional.pad(clean, (0, self.seq_len - clean.size(-1)))
-            noisy = torch.nn.functional.pad(noisy, (0, self.seq_len - noisy.size(-1)))
+            # print("padding")
+            # print(clean.shape, noisy.shape)
+            # clean = torch.nn.functional.pad(clean, (0, self.seq_len - clean.size(-1)))
+            # noisy = torch.nn.functional.pad(noisy, (0, self.seq_len - noisy.size(-1)))
+            repeat_times = self.seq_len // clean.size(-1) + 1
+            clean = clean.repeat(1, repeat_times)
+            noisy = noisy.repeat(1, repeat_times)
+            clean = clean[:, :self.seq_len]
+            noisy = noisy[:, :self.seq_len]
+            # print(clean.shape, noisy.shape)
         elif clean.size(-1) > self.seq_len:
             offset = np.random.randint(0, clean.size(-1) - self.seq_len)
             clean = clean[..., offset:offset+self.seq_len]
             noisy = noisy[..., offset:offset+self.seq_len]
         return clean, noisy
 
-# # Example Usage
-# speech_list = ['./path/to/speech1.wav', './path/to/speech2.wav']
-# noise_list = ['./path/to/noise1.wav', './path/to/noise2.wav']
-# rir_list = ['./path/to/rir1.wav', './path/to/rir2.wav']
-# degradation_config = default_degradation_config
-
-# dataset = AudioDataset(speech_list, noise_list, rir_list, degradation_config)
-# speech_sample, noisy_speech = dataset[0]  # Fetch the first item
+if __name__ == "__main__":
+    speech_list = "/mnt/data2/zhangjunan/enhancement/data/masksr/speech_fullband.scp"
+    noise_list = "/mnt/data2/zhangjunan/enhancement/data/masksr/noise.scp"
+    rir_list = "/mnt/data2/zhangjunan/enhancement/data/masksr/rir.scp"
+    
+    degradation_config = {
+        "p_noise": 0.9,
+        "snr_min": -5,
+        "snr_max": 40,
+        
+        "p_reverb": 0.25,
+        
+        "p_clipping": 0.25,
+        "clipping_min_quantile": 0.1,
+        "clipping_max_quantile": 0.5,
+        
+        "p_bandwidth_limitation": 0.5,
+        "bandwidth_limitation_rates": [
+            1000,
+            2000,
+            4000,
+            8000,
+            16000,
+            22050,
+        ],
+        "bandwidth_limitation_methods": [
+            "kaiser_best",
+            "kaiser_fast",
+            "scipy",
+            "polyphase",
+        ],
+    }
+    
+    dataset = AudioDegradationDataset(speech_list, noise_list, rir_list, degradation_config)
+    
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
+    
+    for batch in dataloader:
+        print(batch[0].shape, batch[1].shape)
+        break

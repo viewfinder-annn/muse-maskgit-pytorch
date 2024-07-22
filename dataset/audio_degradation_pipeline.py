@@ -181,29 +181,16 @@ def bandwidth_limitation(speech_sample, fs: int, fs_new: int, res_type="kaiser_b
     return ret[:, : speech_sample.shape[1]]
 
 
-def clipping(speech_sample, min_quantile: float = 0.0, max_quantile: float = 0.9):
+def clipping(speech_sample, min_quantile: float = 0.06, max_quantile: float = 0.9):
     """Apply the clipping distortion to the input signal.
-
-    Args:
-        speech_sample (np.ndarray): a single speech sample (1, Time)
-        min_quantile (float): lower bound on the quantile of samples to be clipped
-        max_quantile (float): upper bound on the quantile of samples to be clipped
-
-    Returns:
-        ret (np.ndarray): clipped speech sample (1, Time)
+    speech_sample: np.ndarray, a single speech sample (1, Time)
+    threshold: float, the threshold for clipping
     """
-    q = np.array([min_quantile, max_quantile])
-    min_, max_ = np.quantile(speech_sample, q, axis=-1, keepdims=False)
-    # per-channel clipping
-    ret = np.stack(
-        [
-            np.clip(speech_sample[i], min_[i], max_[i])
-            for i in range(speech_sample.shape[0])
-        ],
-        axis=0,
-    )
+    
+    threshold = random.uniform(min_quantile, max_quantile)
+    ret = np.clip(speech_sample, -threshold, threshold)
+    
     return ret
-
 
 #############################
 # Audio utilities
@@ -322,7 +309,7 @@ def process_from_audio_path(speech, noise, rir=None, fs=None, force_1ch=True, de
         noisy_speech = bandwidth_limitation(noisy_speech, fs=fs, fs_new=fs_new, res_type=res_type)
     
     # normalization
-    scale = 0.9 / max(
+    scale = 1 / max(
         np.max(np.abs(noisy_speech)),
         np.max(np.abs(speech_sample)),
         np.max(np.abs(noise_sample)),
@@ -372,9 +359,9 @@ if __name__ == "__main__":
 
         return speech_paths, noise_paths, rir_paths
     
-    speech_list = "/mnt/data2/zhangjunan/urgent2024_challenge/data/noise_train.scp"
-    noise_list = "/mnt/data2/zhangjunan/urgent2024_challenge/data/noise_train.scp"
-    rir_list = "/mnt/data2/zhangjunan/urgent2024_challenge/data/rir_train.scp"
+    speech_list = "/mnt/data2/zhangjunan/enhancement/data/voicefixer/processed_noise_rir/noise.scp"
+    noise_list = "/mnt/data2/zhangjunan/enhancement/data/voicefixer/processed_noise_rir/noise.scp"
+    rir_list = "/mnt/data2/zhangjunan/enhancement/data/voicefixer/processed_noise_rir/rir.scp"
     
     speech_list, noise_list, rir_list = get_list(speech_list, noise_list, rir_list, '/mnt/data2/zhangjunan/urgent2024_challenge/')
     src = '/mnt/data3/share/svc-data/vocalist'
@@ -412,7 +399,7 @@ if __name__ == "__main__":
     import random
     from tqdm import tqdm
     speech_paths = random.sample(speech_list, 200)
-    dst = '/mnt/data2/zhangjunan/enhancement/data/singing_scp/testset'
+    dst = '/mnt/data2/zhangjunan/enhancement/data/singing_scp/testset_unseen'
     
     os.makedirs(os.path.join(dst, 'clean'), exist_ok=True)
     os.makedirs(os.path.join(dst, 'noisy'), exist_ok=True)

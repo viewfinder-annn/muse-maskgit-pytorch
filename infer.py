@@ -6,6 +6,7 @@ import json5
 import json
 from trainer import pad_or_truncate, get_model
 import time
+os.environ['PYTHONIOENCODING'] = 'utf-8'
 
 def load_model(model_path, config, device):
     model = get_model(config['model'], device)  # get_model needs to be defined or imported appropriately
@@ -28,6 +29,7 @@ def infer(model, input_folder, output_folder, device):
     for file_name in tqdm(file_list):
         file_path = os.path.join(input_folder, file_name)
         signal, sr = torchaudio.load(file_path)
+        signal = torch.mean(signal, dim=0, keepdim=True)  # 如果音频有多个声道，取平均值
         signal = signal.to(device)
 
         # 重采样到模型需要的采样率
@@ -72,9 +74,11 @@ def main(model_path, config_path, input_folder, exp, resample=None, dnsmos=False
     model_dir = os.path.split(os.path.dirname(model_path))[-1]
     output_folder = os.path.join(exp, 'infer', model_dir, time.strftime('%Y%m%d-%H:%M:%S'))
     os.makedirs(output_folder, exist_ok=True)
-    with open(os.path.join(output_folder, 'metadata.json'), 'w') as f:
+    metadata = {'model_path': model_path, 'config_path': config_path, 'input_folder': input_folder, 'output_folder': output_folder, 'resample': resample, 'dnsmos': dnsmos}
+    # print(metadata)
+    with open(os.path.join(output_folder, 'metadata.json'), 'w', encoding='utf-8') as f:
         # json.dump(vars(args), f, indent=4)
-        json.dump({'model_path': model_path, 'config_path': config_path, 'input_folder': input_folder, 'output_folder': output_folder, 'resample': resample, 'dnsmos': dnsmos}, f, indent=4)
+        json.dump(metadata, f, indent=4, ensure_ascii=False)
 
     config = json5.load(open(config_path))
     device = config['train']['device']

@@ -7,6 +7,17 @@ nohup sh -c 'CUDA_VISIBLE_DEVICES=1 python -u trainer.py --config ./config/urgen
 nohup sh -c 'CUDA_VISIBLE_DEVICES=1 python -u trainer.py --config ./config/singing-55M.json' >> ./singing-55M.log &
 
 nohup sh -c 'CUDA_VISIBLE_DEVICES=0 python -u trainer.py --config ./config/masksr-55M.json' >> ./masksr-55M.log &
+nohup sh -c 'CUDA_VISIBLE_DEVICES=2 python -u trainer.py --config ./config/masksr-55M.json' >> ./masksr-55M-2.log &
+
+nohup sh -c 'CUDA_VISIBLE_DEVICES=1 python -u trainer.py --config ./config/masksr-55M-32.json' >> ./masksr-55M-32.log &
+
+nohup sh -c 'CUDA_VISIBLE_DEVICES=2 python -u trainer.py --config ./config/masksr-55M.json --resume_path /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/masksr-55M-20240717-16:43/model/epoch-28-step-180000-loss-4.5970530169487' >> ./masksr-55M-2.log &
+
+nohup sh -c 'CUDA_VISIBLE_DEVICES=6 python -u trainer.py --config ./config/masksr-55M-encoder-loss.json' >> ./masksr-55M-encoder-loss.log &
+
+nohup sh -c 'CUDA_VISIBLE_DEVICES=0 python -u trainer.py --config ./config/masksr-55M-encoder-loss.json --resume_path /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/masksr-55M-encoder-loss-20240718-21:00/model/epoch-6-step-85000-loss-5.460196696186066' >> ./masksr-55M-encoder-loss.log &
+
+nohup sh -c 'CUDA_VISIBLE_DEVICES=3 python -u trainer.py --config ./config/singing-55M-encoder-loss.json' >> ./singing-55M-encoder-loss.log &
 
 nohup sh -c 'CUDA_VISIBLE_DEVICES=2 python -u trainer.py --config ./config/urgentchallenge2024-55M.json --resume_path /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/urgentchallenge2024-55M-20240711-20:19/model/epoch-4-step-60000-loss-4.687433513641357' >> ./urgentchallenge2024-55M-2.log &
 
@@ -18,3 +29,7 @@ nohup sh -c 'CUDA_VISIBLE_DEVICES=0 python -u infer.py --config ./config/urgentc
 
 # DNS2020
 nohup sh -c 'CUDA_VISIBLE_DEVICES=4 python -u infer.py --config ./config/urgentchallenge2024-55M.json --exp /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/urgentchallenge2024-55M-20240712-11:53 --model /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/urgentchallenge2024-55M-20240712-11:53/model/epoch-0-step-70000-loss-4.6050121807098385/model.pt --input_folder /mnt/data2/zhangjunan/dns2020-repo/datasets/test_set/synthetic/no_reverb/noisy --resample 16000' >> ./voicebank-demand48k-schedule-infer2.log &
+
+nohup sh -c 'CUDA_VISIBLE_DEVICES=4 python -u infer.py --config ./config/masksr-55M-encoder-loss.json --exp /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/masksr-55M-encoder-loss-20240718-21:00 --model /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/masksr-55M-encoder-loss-20240718-21:00/model/epoch-4-step-60000-loss-5.640347515773773/model.pt --input_folder /mnt/data2/zhangjunan/dns2020-repo/datasets/test_set/real_recordings --resample 16000 --dnsmos' >> ./voicebank-demand48k-schedule-infer2.log &
+
+nohup sh -c 'CUDA_VISIBLE_DEVICES=4 python -u infer.py --config ./config/masksr-55M-encoder-loss.json --exp /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/masksr-55M-encoder-loss-20240718-21:00 --model /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/masksr-55M-encoder-loss-20240718-21:00/model/epoch-4-step-60000-loss-5.640347515773773/model.pt --input_folder /mnt/data2/zhangjunan/enhancement/data/voicefixer/TestSets/ALL_GSR/simulated --resample 16000 --dnsmos' >> ./voicebank-demand48k-schedule-infer2.log &

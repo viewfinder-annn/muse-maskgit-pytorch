@@ -218,7 +218,9 @@ def calculate_dnsmos_score(testset_dir, dnsmos_path, csv_path=None):
         with open(json_path, 'w') as f:
             json.dump(avg_row, f, indent=4)
     else:
-        print(df.describe())
+        print(f"SIG: {round(df['SIG'].mean(), 3)}")
+        print(f"BAK: {round(df['BAK'].mean(), 3)}")
+        print(f"OVRL: {round(df['OVRL'].mean(), 3)}")
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser()

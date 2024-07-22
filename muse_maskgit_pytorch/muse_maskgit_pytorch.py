@@ -546,6 +546,7 @@ class MaskGit(nn.Module):
         audio_encoder: AudioEncoder,
         transformer: MaskGitTransformer,
         noise_schedule: Callable = cosine_schedule,
+        return_audio_embed: bool = False,
         token_critic: Optional[TokenCritic] = None,
         self_token_critic = False,
         vae: Optional[VQGanVAE] = None,
@@ -561,6 +562,7 @@ class MaskGit(nn.Module):
         self.vq_layers = vq_layers
         
         self.vq_model = vq_model
+        self.return_audio_embed = return_audio_embed
 
         self.cond_drop_prob = cond_drop_prob
 
@@ -737,7 +739,7 @@ class MaskGit(nn.Module):
 
     def forward(
         self,
-        clean_audios: torch.Tensor,
+        clean_audios: torch.Tensor, # [batch, 1, audio_len]
         noisy_audios: torch.Tensor,
         ignore_index = -1,
         texts: Optional[List[str]] = None,
@@ -830,7 +832,10 @@ class MaskGit(nn.Module):
         )
 
         if not exists(self.token_critic) or train_only_generator:
-            return ce_loss
+            if self.return_audio_embed:
+                return ce_loss, audio_embeds
+            else:
+                return ce_loss
 
         # token critic loss
 

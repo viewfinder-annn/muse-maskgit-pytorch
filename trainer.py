@@ -15,40 +15,15 @@ from transformers import get_scheduler as get_transformers_scheduler
 from muse_maskgit_pytorch import MaskGit, MaskGitTransformer, AudioEncoder
 from dataset.degradation_dataset import AudioDegradationDataset
 
+# for w2v-bert 2.0
+from transformers import AutoFeatureExtractor, AutoModel
+
 def pad_or_truncate(x, length=512*256):
     if x.size(-1) < length:
         x = torch.nn.functional.pad(x, (0, length - x.size(-1)))
     elif x.size(-1) > length:
         x = x[..., :length]
     return x
-
-class AudioDataset(Dataset):
-    def __init__(self, data_path, sr=44100, device='cuda'):
-        assert os.path.exists(data_path), f'{data_path} does not exist'
-        assert os.path.exists(os.path.join(data_path, 'clean')), f'{data_path}/clean does not exist'
-        self.clean_path = os.path.join(data_path, 'clean')
-        self.clean_paths = [os.path.join(self.clean_path, f) for f in os.listdir(self.clean_path) if f.endswith('.wav')]
-        self.noisy_paths = [i.replace('clean', 'noisy') for i in self.clean_paths]
-        self.sr = sr
-        self.device = device
-
-    def __len__(self):
-        return len(self.clean_paths)
-
-    def __getitem__(self, idx):
-        clean_signal, _ = torchaudio.load(self.clean_paths[idx])
-        noisy_signal, _ = torchaudio.load(self.noisy_paths[idx])
-        clean_signal = clean_signal.to(self.device)
-        noisy_signal = noisy_signal.to(self.device)
-
-        # Resample and pad/truncate both signals
-        clean_signal = torchaudio.transforms.Resample(orig_freq=_, new_freq=self.sr).to(self.device)(clean_signal)
-        noisy_signal = torchaudio.transforms.Resample(orig_freq=_, new_freq=self.sr).to(self.device)(noisy_signal)
-
-        clean_signal = pad_or_truncate(clean_signal, 512*256)
-        noisy_signal = pad_or_truncate(noisy_signal, 512*256)
-
-        return clean_signal, noisy_signal
 
 def get_dataloader(config, device):
     dataset = AudioDegradationDataset(speech_list=config['train']['speech_list'], noise_list=config['train']['noise_list'], rir_list=config['train']['rir_list'], degradation_config=config['degradation_config'], seq_len=512*256, sr=44100, device=device)
@@ -140,6 +115,38 @@ def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs
     else:
         global_step = 0
     
+    if model.return_audio_embed:
+        semantic_feature_extractor = AutoFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
+        semantic_model = AutoModel.from_pretrained("facebook/w2v-bert-2.0")
+        semantic_model.to(device)
+        semantic_model.eval()
+        resampler = torchaudio.transforms.Resample(44100, 16000).to(device)
+        
+        def resolution_transformation(content, target_len, target_dim=None):
+            """
+            Transform the resolution of the input content to match the target length.
+            
+            Args:
+                content: torch.tensor, shape (batch_size, source_len, dim)
+                target_len: int, target length
+            
+            Returns:
+                mapped_feature: torch.tensor, shape (target_len, dim)
+            """
+
+            batch_size, source_len, width = content.shape
+            if target_dim is not None:
+                width = target_dim
+            
+            content_4d = content.unsqueeze(1)
+            
+            # 使用插值进行上采样或下采样，对每个batch进行处理
+            mapped_feature_tensor = torch.nn.functional.interpolate(content_4d, size=(target_len, width), mode='bilinear', align_corners=False)
+            
+            mapped_feature_tensor = mapped_feature_tensor.squeeze(1)
+            
+            return mapped_feature_tensor
+    
     save_part_loss = 0
     eval_part_loss = 0
 
@@ -147,10 +154,31 @@ def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs
         sum_loss = 0
         model.train()
         for batch_idx, (clean_signals, noisy_signals) in tqdm(enumerate(dataloader), total=len(dataloader)):
-            clean_signals = clean_signals.to(device)
+            clean_signals = clean_signals.to(device) # [batch_size, 1, seq_len]
             noisy_signals = noisy_signals.to(device)
-            loss = model(clean_audios=clean_signals, noisy_audios=noisy_signals)  # Update according to actual model signature
-            loss.backward()
+            if not model.return_audio_embed:
+                loss = model(clean_audios=clean_signals, noisy_audios=noisy_signals)  # Update according to actual model signature
+                loss.backward()
+            else:
+                loss, audio_embed = model(clean_audios=clean_signals, noisy_audios=noisy_signals) # audio_embed: [b, n, dim]
+                clean_audios_16k = resampler(clean_signals)
+                clean_audios_16k = clean_audios_16k.cpu() # [batch_size, 1, seq_len_16k]
+                input_features = torch.cat([
+                    semantic_feature_extractor(audio, sampling_rate=16000, return_tensors='pt', padding=True)['input_features']
+                    for audio in clean_audios_16k
+                ], dim=0) # [batch_size, 136, 160] (80 band mel * 2)
+                with torch.no_grad():
+                    outputs = semantic_model(input_features=input_features.to(device), output_hidden_states=True)
+                    semantic_features = outputs.hidden_states[17] # [batch_size, 136, 1024]
+                semantic_features = resolution_transformation(semantic_features, audio_embed.shape[1], audio_embed.shape[2])
+                
+                # L2 loss
+                encoder_loss = torch.nn.functional.mse_loss(semantic_features, audio_embed)
+                encoder_loss_ratio = 1
+                # encoder_loss_ratio = 0.1
+                loss = loss + encoder_loss_ratio * encoder_loss
+                loss.backward()
+                
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
