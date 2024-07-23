@@ -15,7 +15,6 @@ from einops import rearrange, repeat
 
 from beartype import beartype
 
-from muse_maskgit_pytorch.vqgan_vae import VQGanVAE
 from muse_maskgit_pytorch.attend import Attend
 
 from tqdm.auto import tqdm
@@ -549,14 +548,12 @@ class MaskGit(nn.Module):
         return_audio_embed: bool = False,
         token_critic: Optional[TokenCritic] = None,
         self_token_critic = False,
-        vae: Optional[VQGanVAE] = None,
         cond_drop_prob = 0.1,
         self_cond_prob = 0.9,
         no_mask_token_prob = 0.,
         critic_loss_weight = 1.
     ):
         super().__init__()
-        self.vae = vae.copy_for_eval() if exists(vae) else None
 
         self.seq_len = seq_len
         self.vq_layers = vq_layers
