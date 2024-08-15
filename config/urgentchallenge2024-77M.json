@@ -1,32 +1,30 @@
 {
     "dataset": {
         "sample_rate": 44100,
-        "batch_size": 48,
+        "batch_size": 16,
         "num_workers": 8,
+        "seq_len": 220160, // 430*512, 5s
         "train": {
-            "speech_list": "/mnt/data2/zhangjunan/enhancement/data/singing_scp/wav.scp",
+            "speech_list": "/mnt/data2/zhangjunan/enhancement/data/urgent2024/cleaned_train/speech_train_cleaned_22050_3.3_3.5_4.0.scp",
             "noise_list": "/mnt/data2/zhangjunan/urgent2024_challenge/data/noise_train.scp",
-            "rir_list": "/mnt/data2/zhangjunan/urgent2024_challenge/data/rir_train.scp"
+            "rir_list": "/mnt/data2/zhangjunan/enhancement/data/singing_scp/rir.scp"
         },
-        "test_noisy_path": "/mnt/data2/zhangjunan/enhancement/data/singing_scp/testset/noisy",
+        "test_noisy_path": "/mnt/data2/zhangjunan/dns2020-repo/datasets/test_set/real_recordings",
         "degradation_config": {
+            // add noise
             "p_noise": 0.9,
             "snr_min": -5,
             "snr_max": 20,
-            
-            "p_reverb": 0.25,
-            
-            "p_clipping": 0.25,
-            "clipping_min_quantile": 0.1,
-            "clipping_max_quantile": 0.5,
-            
-            "p_bandwidth_limitation": 0.5,
+            // add reverb
+            "p_reverb": 0.5,
+            // add clipping
+            "p_clipping": 0.05,
+            "clipping_min_db": -20,
+            "clipping_max_db": 0,
+            // apply bandwidth limitation
+            "p_bandwidth_limitation": 0.2,
             "bandwidth_limitation_rates": [
-                4000,
-                8000,
-                16000,
-                22050,
-                32000,
+                8000, 16000, 22050, 24000, 32000
             ],
             "bandwidth_limitation_methods": [
                 "kaiser_best",
@@ -34,15 +32,42 @@
                 "scipy",
                 "polyphase",
             ],
+            // Apply bitcrush
+            "p_bitcrush": 0.0,
+            "bitcrush_min_bits": 3,
+            "bitcrush_max_bits": 8,
+            // Add chorus
+            "p_chorus": 0.0,
+            "rate_hz": 1.0,
+            "depth": 0.25,
+            "centre_delay_ms": 7.0,
+            "feedback": 0.0,
+            "chorus_mix": 0.5,
+            // Add distortion
+            "p_distortion": 0.0,
+            "distortion_min_db": 5,
+            "distortion_max_db": 20,
+            // EQ
+            "p_eq": 0.1,
+            "eq_min_times": 1,
+            "eq_max_times": 3,
+            "eq_min_length": 0.5,
+            "eq_max_length": 1,
+            // package loss
+            "p_pl": 0.0,
+            "pl_min_ratio": 0.05,
+            "pl_max_ratio": 0.1,
+            "pl_min_length": 0.05,
+            "pl_max_length": 0.1,
         }
     },
     "model": {
         "dac_path": "/mnt/data2/zhangjunan/muse-maskgit-pytorch/pretrained/weights.pth",
         "MaskGitTransformer": {
             "num_tokens": 1024,
-            "seq_len": 256,
+            "seq_len": 430,
             "dim": 512,
-            "depth": 8,
+            "depth": 12,
             "dim_head": 64,
             "heads": 8,
             "ff_mult": 4,
@@ -51,7 +76,7 @@
         },
         "AudioEncoder": {
             "dim": 512,
-            "seq_len": 256,
+            "seq_len": 430,
             "input_dim": 1025,
             "n_fft": 2048,
             "hop_length": 512,
@@ -60,15 +85,15 @@
                 1024,
                 512
             ],
-            "transformer_layers": 6,
+            "transformer_layers": 8,
             "transformer_dim": 512,
+            "transformer_dim_head": 64,
             "transformer_heads": 8,
             "transformer_ff_mult": 4,
-            "transformer_dim_head": 64,
             "use_rotary_pos_enc": true,
         },
         "MaskGit": {
-            "seq_len": 256,
+            "seq_len": 430,
             "vq_layers": 9,
             "cond_drop_prob": 0.1,
             "return_audio_embed": true,

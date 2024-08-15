@@ -19,6 +19,16 @@ nohup sh -c 'CUDA_VISIBLE_DEVICES=0 python -u trainer.py --config ./config/masks
 
 nohup sh -c 'CUDA_VISIBLE_DEVICES=3 python -u trainer.py --config ./config/singing-55M-encoder-loss.json' >> ./singing-55M-encoder-loss.log &
 
+sh -c 'CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch trainer.py --config ./config/singing-120M.json' > ./singing-120M.log 2>&1 &
+
+nohup sh -c 'CUDA_VISIBLE_DEVICES=0 python -u trainer.py --config ./config/singing-55M-encoder-loss.json' >> ./singing-55M-encoder-loss.log &
+nohup sh -c 'CUDA_VISIBLE_DEVICES=2 python -u trainer.py --config ./config/singing-55M.json' >> ./singing-55M.log &
+nohup sh -c 'CUDA_VISIBLE_DEVICES=0,1 accelerate launch trainer.py --config ./config/singing-55M-encoder-loss.json' >> ./singing-55M-encoder-loss.log &
+sh -c 'CUDA_VISIBLE_DEVICES=0,1 accelerate launch trainer.py --config ./config/singing-55M-encoder-loss.json  --resume_path /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/20240726-14:11-singing-55M-encoder-loss/model/epoch-102-step-225000-loss-3.998' >> ./singing-55M-encoder-loss.log 2>&1 &
+nohup sh -c 'CUDA_VISIBLE_DEVICES=2,3 accelerate launch --main_process_port=29501 trainer.py --config ./config/singing-55M.json' >> ./singing-55M.log &
+sh -c 'CUDA_VISIBLE_DEVICES=2,3 accelerate launch --main_process_port=29501 trainer.py --config ./config/singing-55M.json --resume_path /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/20240726-14:11-singing-55M/model/epoch-172-step-380000-loss-3.6385' >> ./singing-55M.log 2>&1 &
+nohup sh -c 'CUDA_VISIBLE_DEVICES=1 python -u trainer.py --config ./config/singing-55M-encoder-loss.json --resume_path /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/singing-55M-encoder-loss-20240721-13:54/model/epoch-31-step-205000-loss-3.89626143655777' >> ./singing-55M-encoder-loss.log &
+
 nohup sh -c 'CUDA_VISIBLE_DEVICES=2 python -u trainer.py --config ./config/urgentchallenge2024-55M.json --resume_path /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/urgentchallenge2024-55M-20240711-20:19/model/epoch-4-step-60000-loss-4.687433513641357' >> ./urgentchallenge2024-55M-2.log &
 
 nohup sh -c 'CUDA_VISIBLE_DEVICES=0 python -u infer.py --config ./config/voicebank-demand48k-schedule.json --exp /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/voicebank-demand48k-schedule-20240705-01:20 --model /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/voicebank-demand48k-schedule-20240705-01:20/model/epoch-300-loss-1.9844026410368067.pt --input_folder /mnt/data2/zhangjunan/open-universe/data/voicebank_demand/48k/test/noisy' >> ./voicebank-demand48k-schedule-infer.log &
@@ -33,3 +43,7 @@ nohup sh -c 'CUDA_VISIBLE_DEVICES=4 python -u infer.py --config ./config/urgentc
 nohup sh -c 'CUDA_VISIBLE_DEVICES=4 python -u infer.py --config ./config/masksr-55M-encoder-loss.json --exp /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/masksr-55M-encoder-loss-20240718-21:00 --model /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/masksr-55M-encoder-loss-20240718-21:00/model/epoch-4-step-60000-loss-5.640347515773773/model.pt --input_folder /mnt/data2/zhangjunan/dns2020-repo/datasets/test_set/real_recordings --resample 16000 --dnsmos' >> ./voicebank-demand48k-schedule-infer2.log &
 
 nohup sh -c 'CUDA_VISIBLE_DEVICES=4 python -u infer.py --config ./config/masksr-55M-encoder-loss.json --exp /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/masksr-55M-encoder-loss-20240718-21:00 --model /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/masksr-55M-encoder-loss-20240718-21:00/model/epoch-4-step-60000-loss-5.640347515773773/model.pt --input_folder /mnt/data2/zhangjunan/enhancement/data/voicefixer/TestSets/ALL_GSR/simulated --resample 16000 --dnsmos' >> ./voicebank-demand48k-schedule-infer2.log &
+
+# urgent
+nohup sh -c 'CUDA_VISIBLE_DEVICES=4 python -u infer.py --config ./config/urgentchallenge2024-77M.json --exp /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/20240812-23:07-urgentchallenge2024-77M/ --model /mnt/data2/zhangjunan/muse-maskgit-pytorch/exp/20240812-23:07-urgentchallenge2024-77M/model/epoch-143-step-230000-loss-4.7751/model.pt --input_folder /mnt/data2/zhangjunan/enhancement/data/urgent2024/urgent-validation-subset-leaderboard/noisy --dnsmos' >> ./voicebank-demand48k-schedule-infer2.log &
+nohup sh -c 'CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch trainer.py --config ./config/urgentchallenge2024-77M.json' >> ./urgentchallenge2024-77M.log 2>&1
