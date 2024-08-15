@@ -2,10 +2,6 @@
 import sys
 sys.path.append('../')
 
-import re
-from functools import partial
-from pathlib import Path
-
 import librosa
 import numpy as np
 import scipy
@@ -13,8 +9,8 @@ import soundfile as sf
 import random
 from tqdm.contrib.concurrent import process_map
 import torchaudio
-
-from dataset.rir_utils import estimate_early_rir
+import pedalboard as pd
+import math
 
 def framing(
     x,
@@ -155,8 +151,36 @@ def add_reverberation(speech_sample, rir_sample):
     Returns:
         reverberant_sample (np.ndarray): output noisy sample (Channel, Time)
     """
+    # print(f"speech_sample.shape: {speech_sample.shape}, rir_sample.shape: {rir_sample.shape}")
     reverberant_sample = scipy.signal.convolve(speech_sample, rir_sample, mode="full")
     return reverberant_sample[:, : speech_sample.shape[1]]
+
+def add_reverberation_v2(speech_sample, noisy_speech, rir_sample, fs):
+    # print(f"speech_sample.shape: {speech_sample.shape}, rir_sample.shape: {rir_sample.shape}")
+    rir_wav = rir_sample
+    wav_len = speech_sample.shape[1]
+    delay_idx = np.argmax(np.abs(rir_wav[0]))  # get the delay index
+    delay_before_num = int(0.001 * fs)
+    delay_after_num = int(0.005 * fs)
+    idx_start = delay_idx - delay_before_num
+    idx_end = delay_idx + delay_after_num
+    if idx_start < 0:
+        idx_start = 0
+    early_rir = rir_wav[:, idx_start:idx_end]
+    
+    reverbant_speech_early = scipy.signal.fftconvolve(speech_sample, early_rir, mode="full")
+    reverbant_speech = scipy.signal.fftconvolve(noisy_speech, rir_wav, mode="full")
+    
+    reverbant_speech = reverbant_speech[:, idx_start:idx_start + wav_len]
+    reverbant_speech_early = reverbant_speech_early[:, :wav_len]
+    scale = max(abs(reverbant_speech[0]))
+    if scale == 0:
+        scale = 1
+    else:
+        scale = 0.5 / scale
+    reverbant_speech_early = reverbant_speech_early * scale
+    reverbant_speech = reverbant_speech * scale
+    return reverbant_speech, reverbant_speech_early
 
 
 def bandwidth_limitation(speech_sample, fs: int, fs_new: int, res_type="kaiser_best"):
@@ -191,6 +215,57 @@ def clipping(speech_sample, min_quantile: float = 0.06, max_quantile: float = 0.
     ret = np.clip(speech_sample, -threshold, threshold)
     
     return ret
+
+# Function used in EQ
+def power_ratio(r: float, a: float, b: float):
+    return a * math.pow((b / a), r)
+
+def pedalboard_equalizer(wav: np.ndarray, sr: int) -> np.ndarray:
+    """Use pedalboard to do equalizer"""
+    board = pd.Pedalboard()
+
+    cutoff_low_freq = 60
+    cutoff_high_freq = 10000
+
+    q_min = 2
+    q_max = 5
+
+    random_all_freq = True
+    num_filters = 10
+    if random_all_freq:
+        key_freqs = [random.uniform(1, 12000) for _ in range(num_filters)]
+    else:
+        key_freqs = [
+            power_ratio(float(z) / (num_filters - 1), cutoff_low_freq, cutoff_high_freq)
+            for z in range(num_filters)
+        ]
+    q_values = [
+        power_ratio(random.uniform(0, 1), q_min, q_max) for _ in range(num_filters)
+    ]
+    gains = [random.uniform(-12, 12) for _ in range(num_filters)]
+    # low-shelving filter
+    board.append(
+        pd.LowShelfFilter(
+            cutoff_frequency_hz=key_freqs[0], gain_db=gains[0], q=q_values[0]
+        )
+    )
+    # peaking filters
+    for i in range(1, 9):
+        board.append(
+            pd.PeakFilter(
+                cutoff_frequency_hz=key_freqs[i], gain_db=gains[i], q=q_values[i]
+            )
+        )
+    # high-shelving filter
+    board.append(
+        pd.HighShelfFilter(
+            cutoff_frequency_hz=key_freqs[9], gain_db=gains[9], q=q_values[9]
+        )
+    )
+
+    # Apply the pedalboard to the audio
+    processed_audio = board(wav, sr)
+    return processed_audio
 
 #############################
 # Audio utilities
@@ -242,84 +317,242 @@ def save_audio(audio, filename, fs):
 #     "polyphase",
 # )
 
+"""
+Provided degradation functions:
+    - Add noise
+    - Add reverb
+    - Apply bandwidth limitation
+    - Add clipping
+======== New Effect ========
+    - Apply bitcrush
+    - Add chorus
+    - Add distortion
+    - Apply EQ
+    - Add package loss
+"""
 default_degradation_config = {
-    "p_noise": 1.0,
+    # add noise
+    "p_noise": 0.9,
     "snr_min": -5,
-    "snr_max": 40,
-    
-    "p_reverb": 0.25,
-    
-    "p_clipping": 0.25,
-    "clipping_min_quantile": 0.06,
-    "clipping_max_quantile": 0.9,
-    
-    "p_bandwidth_limitation": 0.5,
+    "snr_max": 20,
+    # add reverb
+    "p_reverb": 0.5,
+    # add clipping
+    "p_clipping": 0.2,
+    "clipping_min_db": -20,
+    "clipping_max_db": 0,
+    # apply bandwidth limitation
+    "p_bandwidth_limitation": 0.2,
     "bandwidth_limitation_rates": [
+        4000,
         8000,
         16000,
         22050,
-        24000,
         32000,
-        44100,
-        48000,
     ],
-    "bandwidth_limitation_methods": [
-        "kaiser_best",
-        "kaiser_fast",
-        "scipy",
-        "polyphase",
+    "quality": [
+        0,  # pd.Resample.Quality.ZeroOrderHold,
+        1,  # pd.Resample.Quality.Linear,
+        2,  # pd.Resample.Quality.CatmullRom,
+        3,  # pd.Resample.Quality.Lagrange,
+        4   # pd.Resample.Quality.WindowedSinc,
     ],
+    # Apply bitcrush
+    "p_bitcrush": 0.0,
+    "bitcrush_min_bits": 3,
+    "bitcrush_max_bits": 8,
+    # Add chorus
+    "p_chorus": 0.05,
+    "rate_hz": 1.0,
+    "depth": 0.25,
+    "centre_delay_ms": 7.0,
+    "feedback": 0.0,
+    "chorus_mix": 0.5,
+    # Add distortion
+    "p_distortion": 0.05,
+    "distortion_min_db": 5,
+    "distortion_max_db": 20,
+    # EQ
+    "p_eq": 0.1,
+    "eq_min_times": 1,
+    "eq_max_times": 3,
+    "eq_min_length": 0.5,
+    "eq_max_length": 1,
+    # package loss
+    "p_pl": 0.05,
+    "pl_min_ratio": 0.05,
+    "pl_max_ratio": 0.1,
+    "pl_min_length": 0.05,
+    "pl_max_length": 0.1,
 }
 
-def process_from_audio_path(speech, noise, rir=None, fs=None, force_1ch=True, degradation_config=default_degradation_config): 
+# def pad_or_truncate(audio, length):
+#     if audio.shape[1] < length:
+#         # repeat the audio
+#         n_repeats = length // audio.shape[1] + 1
+#         audio = np.tile(audio, (1, n_repeats))[:, :length]
+#     elif audio.shape[1] > length:
+#         audio = audio[:, :length]
+#     return audio
+
+def process_from_audio_path(
+    vocal_path,
+    noise_path,
+    rir_path=None,
+    fs=None,
+    force_1ch=True,
+    degradation_config=default_degradation_config,
+    length=None,
+):
     if fs is None:
-        fs = sf.info(speech).samplerate
-    
-    speech_sample = read_audio(speech, force_1ch=force_1ch, fs=fs)[0]
-    noise_sample = read_audio(noise, force_1ch=force_1ch, fs=fs)[0]
-    
+        fs = sf.info(vocal_path).samplerate
+
+    vocal, _ = read_audio(vocal_path, force_1ch=force_1ch, fs=fs)
+    noise, _ = read_audio(noise_path, force_1ch=force_1ch, fs=fs)
+    # if length is not None:
+    #     vocal = pad_or_truncate(vocal, length)
+    noisy_vocal = vocal.copy()
+
+    # add package loss
+    if random.random() < degradation_config["p_pl"]:
+        # print('add pl')
+        # 随机将一些帧替换为空帧
+        # 定义要丢失的帧数比例
+        replace_ratio = random.uniform(
+            degradation_config["pl_min_ratio"], degradation_config["pl_max_ratio"]
+        )
+
+        # 计算要丢失的总帧数
+        total_frames_to_replace = int(vocal.shape[1] * replace_ratio)
+
+        # 初始化一个空的集合来存储要丢失的帧的索引
+        replace_indices = set()
+
+        # 随机生成丢失帧的起始位置和长度
+        while len(replace_indices) < total_frames_to_replace:
+            start_index = np.random.randint(0, vocal.shape[1])
+            length = np.random.randint(fs * degradation_config["pl_min_length"], fs * degradation_config["pl_max_length"])
+            end_index = min(start_index + length, vocal.shape[1])
+            replace_indices.update(range(start_index, end_index))
+
+        # 将选定的帧替换为空帧（假设空帧为零）
+        noisy_vocal[0, list(replace_indices)] = 0
+
+    # Apply EQ
+    if random.random() < degradation_config["p_eq"]:
+        # print('add eq')
+        # 随机确定均衡器处理的次数
+        num_eq = random.randint(degradation_config['eq_min_times'], degradation_config['eq_max_times'])
+
+        processed_audio = np.array([])  # 初始化处理后音频的空数组
+        last_end_sample = 0  # 跟踪上次处理后的结束位置
+
+        for _ in range(num_eq):
+            # 随机确定当前处理段的长度（秒）
+            segment_duration = random.uniform(degradation_config['eq_min_length'], degradation_config['eq_max_length'])
+            segment_length = int(segment_duration * fs)
+
+            # print(last_end_sample, noisy_vocal.shape[-1], segment_length)
+            # 随机选择当前处理段的起始位置
+            start_sample = random.randint(last_end_sample, max(last_end_sample, noisy_vocal.shape[-1] - segment_length))
+            # print("start_sample: ", start_sample)
+
+            # 确定结束位置
+            end_sample = min(start_sample + segment_length, noisy_vocal.shape[-1])
+
+            # 从音频中切割该段
+            segment = noisy_vocal[:, start_sample:end_sample]
+
+            # 应用均衡器处理
+            processed_segment = pedalboard_equalizer(segment, fs)
+
+            # 如果是第一次处理，直接赋值，否则合并
+            if processed_audio.size == 0:
+                processed_audio = np.concatenate((noisy_vocal[:, :start_sample], processed_segment), axis=-1)
+            else:
+                processed_audio = np.concatenate((processed_audio, noisy_vocal[:, last_end_sample:start_sample], processed_segment), axis=-1)
+
+            # 更新上次处理的结束位置
+            last_end_sample = end_sample
+            if last_end_sample >= noisy_vocal.shape[-1]:
+                break
+
+        # 处理完毕后，将最后一段未处理的音频添加到末尾
+        if last_end_sample < noisy_vocal.shape[-1]:
+            processed_audio = np.concatenate((processed_audio, noisy_vocal[:, last_end_sample:]), axis=-1)
+        
+        noisy_vocal = processed_audio
+
+    # add reverb
+    if rir_path is not None and random.random() < degradation_config["p_reverb"]:
+        # print('add reverb')
+        rir_sample = read_audio(rir_path, force_1ch=force_1ch, fs=fs)[0]
+        noisy_vocal, vocal = add_reverberation_v2(vocal, noisy_vocal, rir_sample, fs)
+
+    # Apply chorus
+    if random.random() < degradation_config["p_chorus"]:
+        # print('add chorus')
+        noisy_vocal = pd.Chorus(
+            rate_hz=random.uniform(0.1, 3.0),
+            depth=random.uniform(0, 1),
+            centre_delay_ms=float(random.randint(1, 30)),
+            feedback=random.uniform(-0.5, 0.5),
+            mix=random.uniform(0.4, 0.6),
+        )(noisy_vocal, fs)
+
     # add noise
     if random.random() < degradation_config["p_noise"]:
+        # print('add noise')
         snr = random.uniform(degradation_config["snr_min"], degradation_config["snr_max"])
-        noisy_speech, noise_sample = add_noise(speech_sample, noise_sample, snr=snr, rng=np.random.default_rng())
-    else:
-        noisy_speech = speech_sample
-    
-    # add reverb
-    if rir is not None and random.random() < degradation_config["p_reverb"]:
-        rir_sample = read_audio(rir, force_1ch=force_1ch, fs=fs)[0]
-        noisy_speech = add_reverberation(noisy_speech, rir_sample)
-        early_rir_sample = estimate_early_rir(rir_sample, fs=fs)
-        speech_sample = add_reverberation(speech_sample, early_rir_sample)
-    # else:
-    #     noisy_speech = speech_sample
-    
-    # # add noise
-    # snr = random.uniform(snr_min, snr_max)
-    # noisy_speech, noise_sample = add_noise(noisy_speech, noise_sample, snr=snr, rng=np.random.default_rng())
-    
-    # add clipping
+        noisy_vocal, noise_sample = add_noise(noisy_vocal, noise, snr=snr, rng=np.random.default_rng())
+
+    if random.random() < degradation_config["p_bitcrush"]:
+        # print('add bitcrush')
+        noisy_vocal = pd.Bitcrush(
+            random.randint(
+                degradation_config["bitcrush_min_bits"],
+                degradation_config["bitcrush_max_bits"],
+            )
+        )(noisy_vocal, fs)
+
     if random.random() < degradation_config["p_clipping"]:
-        noisy_speech = clipping(noisy_speech, min_quantile=degradation_config["clipping_min_quantile"], max_quantile=degradation_config["clipping_max_quantile"])
-    
-    # add bandwidth limitation
+        # print('add clipping')
+        noisy_vocal = pd.Clipping(
+            random.uniform(
+                degradation_config["clipping_min_db"],
+                degradation_config["clipping_max_db"],
+            )  # in decibels (about 0.1-1 of 1.0)
+        )(noisy_vocal, fs)
+
+    if random.random() < degradation_config["p_distortion"]:
+        # print('add distortion')
+        noisy_vocal = pd.Distortion(
+            drive_db=float(random.randint(degradation_config["distortion_min_db"], degradation_config["distortion_max_db"]))
+        )(noisy_vocal, fs)
+
     if random.random() < degradation_config["p_bandwidth_limitation"]:
+        # print('add bandwidth limitation')
         fs_new = random.choice(degradation_config["bandwidth_limitation_rates"])
         res_type = random.choice(degradation_config["bandwidth_limitation_methods"])
-        noisy_speech = bandwidth_limitation(noisy_speech, fs=fs, fs_new=fs_new, res_type=res_type)
-    
+        noisy_vocal = bandwidth_limitation(noisy_vocal, fs=fs, fs_new=fs_new, res_type=res_type)
+        # tgt_fs = random.choice(degradation_config["bandwidth_limitation_rates"])
+        # noisy_vocal = pd.Resample(
+        #     target_sample_rate=tgt_fs,
+        #     quality=pd.Resample.Quality(random.randint(0, 4))
+        # )(noisy_vocal, fs)
+
     # normalization
     scale = 1 / max(
-        np.max(np.abs(noisy_speech)),
-        np.max(np.abs(speech_sample)),
-        np.max(np.abs(noise_sample)),
+        np.max(np.abs(noisy_vocal)),
+        np.max(np.abs(vocal)),
+        np.max(np.abs(noise)),
     )
 
-    speech_sample *= scale
-    noise_sample *= scale
-    noisy_speech *= scale
-    
-    return speech_sample, noise_sample, noisy_speech, fs
+    vocal *= scale
+    noise *= scale
+    noisy_vocal *= scale
+
+    return vocal, noise, noisy_vocal, fs
     
 if __name__ == "__main__":
     # speech = './test_audio/p232_006.wav'
@@ -368,38 +601,68 @@ if __name__ == "__main__":
     speech_list = glob.glob(os.path.join(src, '**/*.wav'), recursive=True)
     
     degradation_config = {
-            "p_noise": 1.0,
-            "snr_min": -5,
-            "snr_max": 20,
-            
-            "p_reverb": 0.5,
-            
-            "p_clipping": 0.25,
-            "clipping_min_quantile": 0.06,
-            "clipping_max_quantile": 0.9,
-            
-            "p_bandwidth_limitation": 0.5,
-            "bandwidth_limitation_rates": [
-                1000,
-                2000,
-                4000,
-                8000,
-                16000,
-                22050,
-                32000,
-            ],
-            "bandwidth_limitation_methods": [
-                "kaiser_best",
-                "kaiser_fast",
-                "scipy",
-                "polyphase",
-            ],
-        }
+        # add noise
+        "p_noise": 0.9,
+        "snr_min": -5,
+        "snr_max": 20,
+        # add reverb
+        "p_reverb": 0.5,
+        # add clipping
+        "p_clipping": 0.2,
+        "clipping_min_db": -20,
+        "clipping_max_db": 0,
+        # apply bandwidth limitation
+        "p_bandwidth_limitation": 0.2,
+        "bandwidth_limitation_rates": [
+            4000,
+            8000,
+            16000,
+            22050,
+            32000,
+        ],
+        "quality": [
+            0,  # pd.Resample.Quality.ZeroOrderHold,
+            1,  # pd.Resample.Quality.Linear,
+            2,  # pd.Resample.Quality.CatmullRom,
+            3,  # pd.Resample.Quality.Lagrange,
+            4   # pd.Resample.Quality.WindowedSinc,
+        ],
+        # Apply bitcrush
+        "p_bitcrush": 0.0,
+        "bitcrush_min_bits": 3,
+        "bitcrush_max_bits": 8,
+        # Add chorus
+        "p_chorus": 0.05,
+        "rate_hz": 1.0,
+        "depth": 0.25,
+        "centre_delay_ms": 7.0,
+        "feedback": 0.0,
+        "chorus_mix": 0.5,
+        # Add distortion
+        "p_distortion": 0.05,
+        "distortion_min_db": 5,
+        "distortion_max_db": 20,
+        # EQ
+        "p_eq": 0.1,
+        "eq_min_times": 1,
+        "eq_max_times": 3,
+        "eq_min_length": 0.5,
+        "eq_max_length": 1,
+        # package loss
+        "p_pl": 0.05,
+        "pl_min_ratio": 0.05,
+        "pl_max_ratio": 0.1,
+        "pl_min_length": 0.05,
+        "pl_max_length": 0.1,
+    }
     
     import random
     from tqdm import tqdm
     speech_paths = random.sample(speech_list, 200)
-    dst = '/mnt/data2/zhangjunan/enhancement/data/singing_scp/testset_unseen'
+    dst = '/mnt/data2/zhangjunan/enhancement/data/singing_scp/testset_unseen_new'
+    import shutil
+    shutil.rmtree(dst, ignore_errors=True)
+    os.makedirs(dst, exist_ok=True)
     
     os.makedirs(os.path.join(dst, 'clean'), exist_ok=True)
     os.makedirs(os.path.join(dst, 'noisy'), exist_ok=True)
@@ -409,9 +672,9 @@ if __name__ == "__main__":
         # print(f"speech_path: {speech_path}, noise_path: {noise_path}, rir_path: {rir_path}")
         
         speech_sample, noise_sample, noisy_speech, fs = process_from_audio_path(
-            speech=speech_path, 
-            noise=noise_path, 
-            rir=rir_path, 
+            vocal_path=speech_path, 
+            noise_path=noise_path, 
+            rir_path=rir_path, 
             fs=44100, 
             force_1ch=True,
             degradation_config=degradation_config

@@ -35,14 +35,18 @@ class AudioDegradationDataset(Dataset):
                     list_paths.append(full_path)
             return list_paths
         
-        if 'singing_scp' in speech_list:
-            # 找到第一个空格，之后的内容全部是路径
-            speech_paths = [i.split(' ', 1)[1].strip()
-                            for i in open(speech_list, 'r').readlines()]
-        else:
-            speech_paths = parse_file(speech_list)
+        # if 'singing_scp' in speech_list:
+        # 找到第一个空格，之后的内容全部是路径
+        speech_paths = [i.split(' ', 1)[1].strip()
+                        for i in open(speech_list, 'r').readlines()]
+        # else:
+        #     speech_paths = parse_file(speech_list)
         noise_paths = parse_file(noise_list)
-        rir_paths = parse_file(rir_list) if rir_list else None
+        if 'singing_scp' in rir_list:
+            rir_paths = [i.split(' ', 1)[1].strip()
+                         for i in open(rir_list, 'r').readlines()]
+        else:
+            rir_paths = parse_file(rir_list) if rir_list else None
 
         return speech_paths, noise_paths, rir_paths
 
@@ -51,18 +55,20 @@ class AudioDegradationDataset(Dataset):
 
     def __getitem__(self, idx):
         speech_path = self.speech_list[idx]
+        # print(speech_path)
         noise_path = random.choice(self.noise_list)
         rir_path = random.choice(self.rir_list) if self.rir_list else None
         # print(f"speech_path: {speech_path}, noise_path: {noise_path}, rir_path: {rir_path}")
-
+        
         # Process the audio file with randomly selected noise and RIR
         speech_sample, noise_sample, noisy_speech, fs = process_from_audio_path(
-            speech=speech_path, 
-            noise=noise_path, 
-            rir=rir_path, 
+            vocal_path=speech_path, 
+            noise_path=noise_path, 
+            rir_path=rir_path, 
             fs=self.sr, 
             force_1ch=True,
-            degradation_config=self.degradation_config
+            degradation_config=self.degradation_config,
+            length=self.seq_len,
         )
         
         assert speech_sample.shape == noisy_speech.shape
