@@ -88,6 +88,106 @@ def FeedForward(dim, mult = 4):
         nn.Linear(inner_dim, dim, bias = False)
     )
 
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, seq_len, dim):
+        super(SinusoidalPositionalEncoding, self).__init__()
+        self.seq_len = seq_len
+        self.dim = dim
+        self.sinusoidal_embeddings = self.create_sinusoidal_embeddings(seq_len, dim)
+
+    def create_sinusoidal_embeddings(self, seq_len, dim):
+        position = torch.arange(seq_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2) * -(math.log(10000.0) / dim))
+        sinusoidal_embeddings = torch.zeros(seq_len, dim)
+        sinusoidal_embeddings[:, 0::2] = torch.sin(position * div_term)
+        sinusoidal_embeddings[:, 1::2] = torch.cos(position * div_term)
+        
+        return nn.Parameter(sinusoidal_embeddings, requires_grad=False)
+
+    def forward(self, x):
+        self.sinusoidal_embeddings.to(x.device)
+        # x: [b, n, dim]
+        return x + self.sinusoidal_embeddings[:x.size(1)]
+
+# RoPE from https://github.com/meta-llama/llama/blob/main/llama/model.py#L80
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    """
+    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+
+    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
+    and the end index 'end'. The 'theta' parameter scales the frequencies.
+    The returned tensor contains complex values in complex64 data type.
+
+    Args:
+        dim (int): Dimension of the frequency tensor.
+        end (int): End index for precomputing frequencies.
+        theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
+
+    Returns:
+        torch.Tensor: Precomputed frequency tensor with complex exponentials.
+    """
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)  # type: ignore
+    freqs = torch.outer(t, freqs).float()  # type: ignore
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    """
+    Reshape frequency tensor for broadcasting it with another tensor.
+
+    This function reshapes the frequency tensor to have the same shape as the target tensor 'x'
+    for the purpose of broadcasting the frequency tensor during element-wise operations.
+
+    Args:
+        freqs_cis (torch.Tensor): Frequency tensor to be reshaped. shape: [n, dim_head]
+        x (torch.Tensor): Target tensor for broadcasting compatibility. shape: [b, n, head, dim_head]
+
+    Returns:
+        torch.Tensor: Reshaped frequency tensor.
+
+    Raises:
+        AssertionError: If the frequency tensor doesn't match the expected shape.
+        AssertionError: If the target tensor 'x' doesn't have the expected number of dimensions.
+    """
+    # print("freqs_cis.shape: ", freqs_cis.shape) # [n, dim_head]
+    # print("x.shape: ", x.shape) # [b, n, head, dim_head]
+    ndim = x.ndim
+    assert 0 <= 1 < ndim
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
+
+
+def apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply rotary embeddings to input tensors using the given frequency tensor.
+
+    This function applies rotary embeddings to the given query 'xq' and key 'xk' tensors using the provided
+    frequency tensor 'freqs_cis'. The input tensors are reshaped as complex numbers, and the frequency tensor
+    is reshaped for broadcasting compatibility. The resulting tensors contain rotary embeddings and are
+    returned as real tensors.
+
+    Args:
+        xq (torch.Tensor): Query tensor to apply rotary embeddings.
+        xk (torch.Tensor): Key tensor to apply rotary embeddings.
+        freqs_cis (torch.Tensor): Precomputed frequency tensor for complex exponentials.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
+    """
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = freqs_cis.to(xq_.device)
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -126,6 +226,7 @@ class Attention(nn.Module):
     def forward(
         self,
         x,
+        freqs_cis = None,
         context = None,
         context_mask = None
     ):
@@ -142,6 +243,14 @@ class Attention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
 
+        if exists(freqs_cis):
+            q = q.transpose(1, 2) # [b, h, n, d] -> [b, n, h, d]
+            k = k.transpose(1, 2)
+            q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+        
+        # 创建空键/值对, so network can choose to pay attention to nothing
         nk, nv = self.null_kv
         nk, nv = map(lambda t: repeat(t, 'h 1 d -> b h 1 d', b = x.shape[0]), (nk, nv))
 
@@ -216,9 +325,9 @@ class SelfTransformerBlocks(nn.Module):
 
         self.norm = LayerNorm(dim)
 
-    def forward(self, x):
+    def forward(self, x, freqs_cis = None):
         for attn, ff in self.layers:
-            x = attn(x) + x
+            x = attn(x, freqs_cis=freqs_cis) + x
             x = ff(x) + x
 
         return self.norm(x)
@@ -236,6 +345,7 @@ class Transformer(nn.Module):
         self_cond = False,
         add_mask_id = False,
         vq_layers = 1,
+        use_rotary_pos_enc = False,
         **kwargs
     ):
         super().__init__()
@@ -244,7 +354,12 @@ class Transformer(nn.Module):
 
         self.num_tokens = num_tokens
         # self.token_emb = nn.Embedding(num_tokens + int(add_mask_id), dim)
-        self.pos_emb = nn.Embedding(seq_len, dim)
+        self.use_rotary_pos_enc = use_rotary_pos_enc
+        if not self.use_rotary_pos_enc:
+            self.pos_emb = SinusoidalPositionalEncoding(seq_len, dim)
+        else:
+            # rotary position encoding
+            self.freqs_cis = precompute_freqs_cis(kwargs.get('dim_head', 64), seq_len)
         self.seq_len = seq_len
         
         # for classifier-free guidance
@@ -343,17 +458,18 @@ class Transformer(nn.Module):
             context_mask = F.pad(context_mask, (0, conditioning_token_ids.shape[-1]), value = True)
 
         # embed tokens
-
-        # x = self.token_emb(x)
-        
-        x = x + self.pos_emb(torch.arange(n, device = device))
+        if not self.use_rotary_pos_enc:
+            x = self.pos_emb(x)
 
         if self.self_cond:
             if not exists(self_cond_embed):
                 self_cond_embed = torch.zeros_like(x)
             x = x + self.self_cond_to_init_embed(self_cond_embed)
 
-        embed = self.transformer_blocks(x)
+        if not self.use_rotary_pos_enc:
+            embed = self.transformer_blocks(x)
+        else:
+            embed = self.transformer_blocks(x, freqs_cis=self.freqs_cis)
 
         logits = torch.stack([linear(embed) for linear in self.to_logits], dim = 1) # [b, vq_layers, n, dim_out]
         # print("logits.shape: ", logits.shape)
@@ -484,7 +600,22 @@ def cosine_schedule(t):
     return torch.cos(t * math.pi * 0.5)
 
 class AudioEncoder(nn.Module):
-    def __init__(self, dim, input_dim, n_fft, hop_length, win_length, mlp_layers, mlp_activation=nn.ReLU(), transformer_layers=6):
+    def __init__(
+        self, 
+        dim,
+        seq_len,
+        input_dim, 
+        n_fft, 
+        hop_length, 
+        win_length, 
+        mlp_layers, 
+        mlp_activation=nn.ReLU(), 
+        transformer_layers=6, 
+        transformer_dim=512,
+        transformer_heads=8,
+        transformer_ff_mult=4,
+        transformer_dim_head=64,
+        use_rotary_pos_enc=False):
         super().__init__()
         self.dim = dim
         self.n_fft, self.hop_length, self.win_length = n_fft, hop_length, win_length
@@ -500,13 +631,19 @@ class AudioEncoder(nn.Module):
 
         # Define Transformer Blocks
         self.transformer_blocks = SelfTransformerBlocks(
-            dim=dim,
-            depth=transformer_layers,  # Example depth
-            dim_head=64,
-            heads=8,
-            ff_mult=4,
+            dim=transformer_dim,
+            depth=transformer_layers,
+            dim_head=transformer_dim_head,
+            heads=transformer_heads,
+            ff_mult=transformer_ff_mult,
             flash=True
         )
+        
+        self.use_rotary_pos_enc = use_rotary_pos_enc
+        if not self.use_rotary_pos_enc:
+            self.pos_emb = SinusoidalPositionalEncoding(seq_len, transformer_dim)
+        else:
+            self.freqs_cis = precompute_freqs_cis(transformer_dim_head, seq_len)
 
     def forward(self, x):
         if len(x.shape) == 3:
@@ -527,9 +664,13 @@ class AudioEncoder(nn.Module):
 
         # Reshape to [batch_size, seq_len, feature_dim] for transformer
         mlp_output = mlp_output.view(x.shape[0], -1, self.dim)  # Adjust according to actual sizes
-
-        # Pass through Transformer
-        embeddings = self.transformer_blocks(mlp_output)
+        
+        if not self.use_rotary_pos_enc:
+            mlp_output = self.pos_emb(mlp_output)
+            # Pass through Transformer
+            embeddings = self.transformer_blocks(mlp_output)
+        else:
+            embeddings = self.transformer_blocks(mlp_output, freqs_cis=self.freqs_cis)
 
         return embeddings
 

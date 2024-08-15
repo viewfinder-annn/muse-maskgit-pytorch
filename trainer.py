@@ -15,6 +15,7 @@ from accelerate import DistributedDataParallelKwargs
 from transformers import get_scheduler as get_transformers_scheduler
 from muse_maskgit_pytorch import MaskGit, MaskGitTransformer, AudioEncoder
 from dataset.degradation_dataset import AudioDegradationDataset
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # for w2v-bert 2.0
 from transformers import AutoFeatureExtractor, AutoModel
@@ -27,7 +28,7 @@ def pad_or_truncate(x, length=512*256):
     return x
 
 def get_dataloader(config, device):
-    dataset = AudioDegradationDataset(speech_list=config['train']['speech_list'], noise_list=config['train']['noise_list'], rir_list=config['train']['rir_list'], degradation_config=config['degradation_config'], seq_len=512*256, sr=44100, device=device)
+    dataset = AudioDegradationDataset(speech_list=config['train']['speech_list'], noise_list=config['train']['noise_list'], rir_list=config['train']['rir_list'], degradation_config=config['degradation_config'], seq_len=config.get('seq_len', 512*256), sr=config['sample_rate'], device=device)
     dataloader = DataLoader(dataset, batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'])
     # TODO: val dataset
     return dataloader
@@ -77,17 +78,18 @@ def get_scheduler(optimizer, config):
         return None
     elif config['scheduler'] == 'linear':
         scheduler_config = config['linear']
+        print(f"current device count: {torch.cuda.device_count()}")
         scheduler = get_transformers_scheduler(
             name='linear',
             optimizer=optimizer,
-            num_warmup_steps=scheduler_config['num_warmup_steps'],
-            num_training_steps=scheduler_config['num_training_steps']
+            num_warmup_steps=scheduler_config['num_warmup_steps'] * torch.cuda.device_count(),
+            num_training_steps=scheduler_config['num_training_steps'] * torch.cuda.device_count()
         )
         return scheduler
     else:
         raise NotImplementedError(f"Scheduler {config['scheduler']} not implemented")
 
-def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs=10, test_noisy_path=None, save_every_step=1000, eval_every_step=1000, resume_path=None):
+def train_loop(config, exp_name, model, dataloader, optimizer, scheduler, device, epochs=10, test_noisy_path=None, save_every_step=1000, eval_every_step=1000, resume_path=None):
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
@@ -99,7 +101,7 @@ def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs
     audio_dst = f'./exp/{exp_name}/output'
     os.makedirs(audio_dst, exist_ok=True)
     
-    input_noisy_paths = random.sample([os.path.join(test_noisy_path, f) for f in os.listdir(test_noisy_path) if f.endswith('.wav')], 20)
+    input_noisy_paths = random.sample([os.path.join(test_noisy_path, f) for f in os.listdir(test_noisy_path) if f.endswith('.wav')], 10)
     if accelerator.is_main_process:
         writer = SummaryWriter(f'./exp/{exp_name}/logs')
     else:
@@ -213,6 +215,10 @@ def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs
             eval_part_loss += loss.item()
             global_step += 1
 
+            # if global_step % 100 == 0:  # 每100步检查一次
+            #     current_lr = optimizer.param_groups[0]['lr']
+            #     print(f"Process {accelerator.process_index}, Step {global_step}, LR: {current_lr}")
+            
             if global_step % eval_every_step == 0 and accelerator.is_main_process:
                 if input_noisy_paths is not None:
                     with torch.no_grad():
@@ -221,18 +227,20 @@ def train_loop(exp_name, model, dataloader, optimizer, scheduler, device, epochs
                             signal, sr = torchaudio.load(input_path)
                             signal = signal.to(device)
                             # resample to 44.1k
-                            signal = torchaudio.transforms.Resample(sr, 44100).to(device)(signal)
-                            signal = pad_or_truncate(signal)
+                            signal = torchaudio.transforms.Resample(sr, config["dataset"]["sample_rate"]).to(device)(signal)
+                            signal = pad_or_truncate(signal, length=config["dataset"]["seq_len"])
                             noisy_audios.append(signal)
                         noisy_audios = torch.stack(noisy_audios)
                         noisy_audios.squeeze_(1)
                         noisy_audios = noisy_audios.to(device)
-                        ids, clean_audios = accelerator.unwrap_model(model).generate(noisy_audios, timesteps=40)
-                        output_dir = f'{audio_dst}/epoch-{epoch}-step-{global_step}-loss-{eval_part_loss/eval_every_step}'
+                        output_dir = f'{audio_dst}/epoch-{epoch}-step-{global_step}-loss-{round(eval_part_loss/eval_every_step, 4)}'
                         os.makedirs(output_dir, exist_ok=True)
-                        for i in range(10):
-                            torchaudio.save(f'{output_dir}/noisy_{i}_enhanced.wav', clean_audios[i].detach().cpu(), 44100)
-                            torchaudio.save(f'{output_dir}/noisy_{i}.wav', noisy_audios[i].unsqueeze(0).detach().cpu(), 44100)
+                        # 分批处理
+                        for i in range(noisy_audios.shape[0]):
+                            noisy_audio = noisy_audios[i].unsqueeze(0)
+                            ids, clean_audios = accelerator.unwrap_model(model).generate(noisy_audio)
+                            torchaudio.save(f'{output_dir}/noisy_{i}.wav', noisy_audio.detach().cpu(), config["dataset"]["sample_rate"])
+                            torchaudio.save(f'{output_dir}/noisy_{i}_enhanced.wav', clean_audios[0].detach().cpu(), config["dataset"]["sample_rate"])
                 eval_part_loss = 0
 
             accelerator.wait_for_everyone()
@@ -279,7 +287,7 @@ def main(config_path, resume_path=None):
     model = get_model(config['model'], device)
     optimizer = get_optimizer(model, config['train'])
     scheduler = get_scheduler(optimizer, config['train'])
-    model = train_loop(exp_name, model, dataloader, optimizer, scheduler, device, config['train']['epochs'], config['dataset']['test_noisy_path'], config['train']['save_every_step'], config['train']['eval_every_step'], resume_path)
+    model = train_loop(config, exp_name, model, dataloader, optimizer, scheduler, device, config['train']['epochs'], config['dataset']['test_noisy_path'], config['train']['save_every_step'], config['train']['eval_every_step'], resume_path)
     return model
 
 if __name__ == '__main__':
